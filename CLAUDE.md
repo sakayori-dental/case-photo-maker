@@ -1,7 +1,7 @@
 # 歯科症例写真 自動合成アプリ — Claude Code 設計書
 
 ## プロジェクト概要
-5枚の歯科口腔内写真 → Claude Vision AI自動分析 → 5パネル合成画像（PNG + WebP）出力の Streamlit アプリ。
+5枚の歯科口腔内写真 → OpenCV自動分析（+ オプションAI微調整）→ 5パネル合成画像（PNG + WebP）出力の Streamlit アプリ。
 
 ## 起動
 ```bash
@@ -42,23 +42,27 @@ streamlit run app.py
 - 一眼レフ横長（約3:2）、歯列が横方向に並んでいる
 - 口腔内全体（口唇・舌・歯肉・ミラー等）が写っている
 
-### AIが行う処理
-1. **回転**: 歯列主軸が垂直になるよう回転（通常80〜100°）
-2. **クロップ**: 臼歯3-4本中心に、歯と歯肉のみ残す大幅クロップ
-3. **ズーム統一**: 全5枚で歯1本あたりの見かけサイズを揃える
+### 処理方式（2つのモード）
+1. **CV自動編集（推奨）**: OpenCVでラバーダム検出 + エッジ密度解析 → 回転・クロップ自動決定。APIキー不要。
+2. **AI自動編集**: Claude Vision APIで2ステップ分析（回転→クロップ）。要APIキー。
+
+### CV処理の仕組み
+- **ラバーダム写真**: HSVで青領域検出 → ダムの「穴」（歯が見える領域）を検出 → 中心・サイズからcrop算出
+- **ミラー写真**: Cannyエッジ + ガウシアン密度 → 歯列のエッジ集中領域を中心にcrop
 
 ### AIプロンプト
-`prompt.txt` に完全なプロンプトを格納。app.py から読み込んで使用。
-プロンプト修正時は prompt.txt だけ編集すればOK。
+`prompt.txt` に完全なプロンプトを格納。AI自動編集モードで使用。
 
 ## 画像処理パイプライン
 ```
 1. Image.open() → EXIF orientation 自動補正
-2. img.rotate(-rotation_cw_deg, expand=True, resample=BICUBIC)
-3. 回転後画像に crop 座標を適用
-4. ImageOps.fit() で 384×1080 にリサイズ
-5. 5パネルを横並びで canvas に paste
-6. フッター or オーバーレイ描画
+2. [CV] OpenCV解析: ラバーダム検出 or エッジ密度 → rotation + crop決定
+   [AI] Claude Vision API 2ステップ: rotation取得 → rotated画像からcrop取得
+3. img.rotate(-rotation_cw_deg, expand=True, resample=BICUBIC)
+4. 回転後画像に crop 座標を適用（zoom_boost で追加ズーム）
+5. ImageOps.fit() で 384×1080 にリサイズ
+6. 5パネルを横並びで canvas に paste
+7. フッター or オーバーレイ描画
 ```
 
 ## UI構成（Streamlit）
