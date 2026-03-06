@@ -1,15 +1,12 @@
 """
-歯科症例写真 自動合成アプリ v3.1
-OpenCV前処理 + オプションAI微調整 → 回転・クロップ・ズーム統一 → 5パネル合成
+歯科症例写真 自動合成アプリ v3.2
+OpenCV自動処理 → 手動微調整 → 5パネル合成
 """
 from __future__ import annotations
 
 import streamlit as st
-import anthropic
-import base64
 import json
 import io
-import re
 import cv2
 import numpy as np
 from pathlib import Path
@@ -19,8 +16,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ExifTags
 # 定数
 # ============================================================
 APP_DIR = Path(__file__).parent
-PROMPT_FILE = APP_DIR / "prompt.txt"
-API_KEY_FILE = APP_DIR / ".api_key"
 REFERENCE_DIR = APP_DIR / "reference"
 
 OUTPUT_PRESETS = {
@@ -39,13 +34,6 @@ PHOTO_LABELS = [
     "⑤ 術後・頬側観",
 ]
 
-PHOTO_DESCRIPTIONS = [
-    "術前の頬側観（ミラー使用、口腔内写真）",
-    "術前の咬合面観（ミラー使用、口腔内写真）",
-    "術中の窩洞形成後（ラバーダム装着、咬合面観）",
-    "術中の充填中（ラバーダム装着、咬合面観）",
-    "術後の頬側観（ミラー使用、口腔内写真）",
-]
 
 FONT_CANDIDATES = [
     "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
@@ -63,38 +51,6 @@ FONT_CANDIDATES = [
 # ============================================================
 # ユーティリティ
 # ============================================================
-def load_api_key() -> str:
-    """保存済みAPIキーを読み込み"""
-    if API_KEY_FILE.exists():
-        return API_KEY_FILE.read_text(encoding="utf-8").strip()
-    return ""
-
-
-def save_api_key(key: str):
-    """APIキーをファイルに保存"""
-    API_KEY_FILE.write_text(key.strip(), encoding="utf-8")
-
-
-def load_prompt() -> str:
-    """prompt.txt からプロンプトテンプレートを読み込み"""
-    if PROMPT_FILE.exists():
-        return PROMPT_FILE.read_text(encoding="utf-8")
-    st.error(f"prompt.txt が見つかりません: {PROMPT_FILE}")
-    return ""
-
-
-def load_reference_images() -> list[dict]:
-    """reference/ 内の完成形画像(1.png, 2.png)をAPI送信用に読み込み"""
-    refs = []
-    for name in ["1.png", "2.png"]:
-        path = REFERENCE_DIR / name
-        if path.exists():
-            img = Image.open(path).convert("RGB")
-            img_bytes = resize_for_api(img, max_dim=1024)
-            refs.append(image_to_base64(img_bytes))
-    return refs
-
-
 def find_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """利用可能な日本語フォントを探す"""
     for path in FONT_CANDIDATES:
@@ -129,46 +85,6 @@ def fix_orientation(img: Image.Image) -> Image.Image:
     except (AttributeError, KeyError):
         pass
     return img
-
-
-def image_to_base64(img_bytes: bytes, media_type: str = "image/jpeg") -> dict:
-    """画像バイトを Claude API 用 base64 辞書に変換"""
-    return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": media_type,
-            "data": base64.b64encode(img_bytes).decode("utf-8"),
-        },
-    }
-
-
-def resize_for_api(img: Image.Image, max_dim: int = 1568) -> bytes:
-    """API送信用にリサイズ（トークン節約）"""
-    w, h = img.size
-    if max(w, h) > max_dim:
-        ratio = max_dim / max(w, h)
-        img = img.resize((int(w * ratio), int(h * ratio)), Image.BICUBIC)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
-
-
-def extract_json_from_response(text: str) -> dict | None:
-    """Claude 応答から JSON を抽出"""
-    pattern = r"```(?:json)?\s*(\{.*?\})\s*```"
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    try:
-        start = text.index("{")
-        end = text.rindex("}") + 1
-        return json.loads(text[start:end])
-    except (ValueError, json.JSONDecodeError):
-        return None
 
 
 # ============================================================
@@ -380,280 +296,6 @@ def cv_create_debug_image(img_pil: Image.Image, rotation_deg: float) -> Image.Im
 
 
 # ============================================================
-# AI 分析（2ステップ）
-# ============================================================
-STEP1_PROMPT = """あなたは歯科口腔内写真の画像処理エキスパートです。
-5枚の歯科症例写真それぞれについて、歯列を垂直にするための回転角度を決定してください。
-
-【ルール】
-- 元写真では歯列が横方向に並んでいるため、80〜100°程度の回転が必要
-- 時計回りが正の値、反時計回りが負の値
-- 臼歯の場合、大臼歯（奥歯）がパネルの下側に来るように回転方向を決める
-
-【回転方向の判断基準（最重要）】
-- 上顎（上の歯）の頬側観ミラー写真: 通常 -90°前後（反時計回り）
-- 上顎の咬合面観ミラー写真: 通常 -80〜-90°前後（反時計回り）
-- ラバーダム装着の咬合面観: 通常 -90°前後（反時計回り）
-- 下顎（下の歯）の頬側観ミラー写真: 通常 +90°前後（時計回り）
-
-※ミラー経由の撮影では画像が反転しているため直感と逆になりやすい。
-※迷った場合は -90° を選択してください（上顎臼歯の症例が多い）。
-
-【写真タイプ別の回転特性】
-- 咬合面観はミラーの角度やカメラ角度の影響で、他の写真より回転角度が浅くなる傾向がある（例: -85°程度）。
-  回転後に歯列の並びが完全に垂直か確認し、傾いていれば微調整すること。
-- 頬側観やラバーダム写真はほぼ正確に90°で問題ない場合が多い。
-
-【入力写真の説明】
-{photo_descriptions}
-
-【出力形式】JSONのみを返してください。
-{"rotations": [<float>, <float>, <float>, <float>, <float>]}
-"""
-
-STEP2_PROMPT = """あなたは歯科口腔内写真の画像処理エキスパートです。
-この回転済みの写真から、歯冠が中央に来るようクロップ範囲を決定してください。
-
-上に添付した「完成形の参考画像」と「各パネルの理想的なクロップ例」を必ず参照してください。
-
-【ルール】
-- 歯3〜4本が画面いっぱいに写るようにクロップ
-- 歯冠がクロップ領域の中央を占めること（参考画像参照）
-- 以下は絶対にクロップ範囲に入れないこと:
-  - クランプ（金属の器具・銀色）
-  - ウェッジ（白い楔状の器具）のうち歯から離れた部分
-  - 口唇・舌・頬粘膜・ミラー柄・ガーゼ
-- 歯肉は少量なら可。ラバーダム（青）は術中なら可
-- 大臼歯が下側にあること（回転済みなので上下の確認のみ）
-- 写真は「{description}」です
-
-【写真タイプ別の注意（過去の補正傾向に基づく一般ルール）】
-
-頬側観（ミラー写真）:
-- 口唇・頬粘膜・ミラー柄など歯冠以外の要素が多く写り込むため、歯冠の占有率が低くなりやすい
-- cropを広めに取ること（ズーム拡大で最終的にタイトになる）
-- Y中心は大臼歯側（下方向）にずれやすい。歯冠列の実際の重心をよく観察すること
-
-咬合面観（ミラー写真）:
-- ミラー角度の影響で、回転後も歯列が完全に垂直にならず数度傾いていることがある
-- 歯列の傾きをよく観察し、回転不足がないか注意すること
-
-ラバーダム装着写真:
-- ラバーダムのシートが片側に広がるため、歯冠がX方向に偏在しやすい
-- X中心を画像の幾何学的中心に置かず、歯冠群の重心に合わせること
-- クランプ金属がフレーム端にある場合はそれを避ける方向にずらすこと
-
-充填中・処置中の写真:
-- 器具やマトリックスバンドが歯冠の片側に写り込むため、Y中心が大臼歯側に偏る傾向がある
-- 器具を避けつつ、歯冠が中央に来るようY中心を調整すること
-
-【全般的な傾向】
-- 歯冠は画像の幾何学的中心にはない。必ず歯冠群の実際の重心を見極めること。
-- X中心は画像中央よりやや左側、Y中心はやや下側（大臼歯寄り）にあることが多い。
-- cropは広めに取っても大丈夫（後でズーム拡大されて最終的にタイトになる）。狭すぎると歯冠がフレームからはみ出す。
-
-【重要】crop範囲は後でさらにズーム拡大されます。そのため:
-- 歯冠がcropの「中央」に正確に来るよう指定してください
-- 端に歯肉や器具があると、ズーム後にそれだけが写ってしまいます
-
-【出力形式】JSONのみを返してください。
-{{"crop": {{"x0": <float 0.0-1.0>, "y0": <float 0.0-1.0>, "x1": <float 0.0-1.0>, "y1": <float 0.0-1.0>}}}}
-"""
-
-
-def step1_get_rotations(
-    client: anthropic.Anthropic,
-    images: list[Image.Image],
-    descriptions: list[str],
-) -> tuple[list[float] | None, str]:
-    """Step 1: 回転角度のみ取得"""
-    desc_text = "\n".join(f"写真{i+1}: {d}" for i, d in enumerate(descriptions))
-    prompt = STEP1_PROMPT.replace("{photo_descriptions}", desc_text)
-
-    content = []
-    for i, img in enumerate(images):
-        img_bytes = resize_for_api(img)
-        content.append({"type": "text", "text": f"--- 写真{i+1}: {descriptions[i]} ---"})
-        content.append(image_to_base64(img_bytes))
-    content.append({"type": "text", "text": prompt})
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = response.content[0].text
-        result = extract_json_from_response(text)
-        if result and "rotations" in result:
-            return result["rotations"], text
-        return None, text
-    except Exception as e:
-        return None, str(e)
-
-
-def step2_get_crop(
-    client: anthropic.Anthropic,
-    rotated_img: Image.Image,
-    description: str,
-    ref_images: list[dict],
-    cropped_refs: list[dict],
-) -> tuple[dict | None, str]:
-    """Step 2: 回転済み画像1枚からcrop座標を取得"""
-    content = []
-
-    if ref_images:
-        content.append({"type": "text", "text": "【完成形の参考画像】"})
-        for ref in ref_images:
-            content.append(ref)
-
-    if cropped_refs:
-        content.append({"type": "text", "text": "【各パネルの理想的なクロップ例（この程度にタイトにクロップすること）】"})
-        for cr in cropped_refs:
-            content.append(cr)
-
-    img_bytes = resize_for_api(rotated_img)
-    content.append({"type": "text", "text": "--- 以下がクロップ対象の回転済み写真です ---"})
-    content.append(image_to_base64(img_bytes))
-    content.append({"type": "text", "text": STEP2_PROMPT.replace("{description}", description)})
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=300,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = response.content[0].text
-        result = extract_json_from_response(text)
-        return result, text
-    except Exception as e:
-        return None, str(e)
-
-
-def load_cropped_references() -> list[dict]:
-    """reference/cropped/ 内のクロップ済み参考画像を読み込み"""
-    cropped_dir = REFERENCE_DIR / "cropped"
-    refs = []
-    if cropped_dir.exists():
-        for path in sorted(cropped_dir.glob("*.png")):
-            img = Image.open(path).convert("RGB")
-            img_bytes = resize_for_api(img, max_dim=512)
-            refs.append(image_to_base64(img_bytes))
-    return refs
-
-
-# ============================================================
-# AI微調整（CV処理後の仕上げ）
-# ============================================================
-AI_REFINE_PROMPT = """あなたは歯科症例写真の構図調整エキスパートです。
-
-【タスク】
-CV処理済みの5パネル合成画像を「完成形」と比較して、各パネルの微調整値を返してください。
-
-【完成形の特徴】
-- 各パネルに臼歯3〜4本が縦方向にちょうど収まるサイズ
-- 歯冠がパネルの中央に位置し、歯冠占有率が70〜80%
-- 口唇・舌・器具・クランプは最小限（端で見切れる程度）
-- ラバーダム（青）は術中写真のみ少量が見える程度
-
-【返すべき値（各パネルごと）】
-- dx: X方向のクロップ中心の移動量（-0.10〜+0.10）。正=右、負=左
-- dy: Y方向のクロップ中心の移動量（-0.10〜+0.10）。正=下、負=上
-- zoom: ズーム倍率（0.80〜1.20）。1.0=変更なし、>1.0=拡大、<1.0=縮小
-
-【判断基準】
-- 完成形より歯が小さい → zoom > 1.0
-- 完成形より歯が大きい → zoom < 1.0
-- 歯列が上寄り → dy > 0（下に移動）
-- 歯列が下寄り → dy < 0（上に移動）
-- 歯列が左寄り → dx > 0（右に移動）
-- 歯列が右寄り → dx < 0（左に移動）
-- 調整不要なパネルは dx=0, dy=0, zoom=1.0 を返す
-
-【出力形式】JSONのみを返してください。説明文は不要です。
-{"adjustments": [
-  {"panel": 1, "dx": <float>, "dy": <float>, "zoom": <float>},
-  {"panel": 2, "dx": <float>, "dy": <float>, "zoom": <float>},
-  {"panel": 3, "dx": <float>, "dy": <float>, "zoom": <float>},
-  {"panel": 4, "dx": <float>, "dy": <float>, "zoom": <float>},
-  {"panel": 5, "dx": <float>, "dy": <float>, "zoom": <float>}
-]}
-"""
-
-
-def ai_refine_panels(
-    client: anthropic.Anthropic,
-    cv_composite: Image.Image,
-    ref_image_path: Path,
-) -> tuple[list[dict] | None, str]:
-    """CV処理済み合成画像を完成形と比較して微調整差分を取得"""
-    content = []
-
-    # 完成形（参考画像）
-    if ref_image_path.exists():
-        ref_img = Image.open(ref_image_path).convert("RGB")
-        ref_bytes = resize_for_api(ref_img, max_dim=1024)
-        content.append({"type": "text", "text": "【完成形（参考画像）】"})
-        content.append(image_to_base64(ref_bytes))
-
-    # CV処理済み合成画像
-    composite_bytes = resize_for_api(cv_composite, max_dim=1568)
-    content.append({"type": "text", "text": "【CV処理済み合成画像（調整対象）】"})
-    content.append(image_to_base64(composite_bytes))
-
-    content.append({"type": "text", "text": AI_REFINE_PROMPT})
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = response.content[0].text
-        result = extract_json_from_response(text)
-        if result and "adjustments" in result:
-            return result["adjustments"], text
-        return None, text
-    except Exception as e:
-        return None, str(e)
-
-
-def apply_ai_adjustments(
-    panels_data: list[dict],
-    adjustments: list[dict],
-) -> list[dict]:
-    """AI微調整差分をCV結果のパネルデータに適用"""
-    refined = []
-    for i, panel in enumerate(panels_data):
-        adj = adjustments[i] if i < len(adjustments) else {}
-        dx = float(adj.get("dx", 0))
-        dy = float(adj.get("dy", 0))
-        zoom = float(adj.get("zoom", 1.0))
-
-        # dx/dyの範囲を制限
-        dx = max(-0.10, min(0.10, dx))
-        dy = max(-0.10, min(0.10, dy))
-        zoom = max(0.80, min(1.20, zoom))
-
-        crop = panel["crop"]
-        cx = (crop["x0"] + crop["x1"]) / 2 + dx
-        cy = (crop["y0"] + crop["y1"]) / 2 + dy
-        hw = (crop["x1"] - crop["x0"]) / 2 / zoom
-        hh = (crop["y1"] - crop["y0"]) / 2 / zoom
-
-        refined.append({
-            **panel,
-            "crop": {
-                "x0": max(0.0, cx - hw),
-                "y0": max(0.0, cy - hh),
-                "x1": min(1.0, cx + hw),
-                "y1": min(1.0, cy + hh),
-            },
-        })
-    return refined
-
-
-# ============================================================
 # 画像処理
 # ============================================================
 def boost_crop(crop: dict, zoom: float) -> dict:
@@ -808,19 +450,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ 設定")
 
-        saved_key = load_api_key()
-        api_key = st.text_input(
-            "Anthropic API Key",
-            value=saved_key,
-            type="password",
-            help="初回入力後は自動保存されます",
-        )
-        if api_key and api_key != saved_key:
-            save_api_key(api_key)
-            st.success("APIキーを保存しました")
-
-        st.divider()
-
         output_mode = st.radio(
             "出力モード",
             ["医院名フッター", "SNSオーバーレイ"],
@@ -856,7 +485,7 @@ def main():
         )
 
         st.divider()
-        st.caption("v3.1 — CV自動 + AI微調整")
+        st.caption("v3.2 — CV自動 + 手動微調整")
 
     # ---- 写真アップロード ----
     st.subheader("📷 写真をアップロード（5枚まとめてドラッグ＆ドロップ可）")
@@ -890,27 +519,20 @@ def main():
         images.append(img.copy())
 
     # ---- 処理ボタン ----
-    col_cv, col_ai = st.columns(2)
-    with col_cv:
-        cv_clicked = st.button(
-            "📐 CV自動編集（+AI微調整）",
-            type="primary",
-            use_container_width=True,
-        )
-    with col_ai:
-        ai_clicked = st.button(
-            "🤖 AI自動編集（Claude Vision）",
-            use_container_width=True,
-        )
+    cv_clicked = st.button(
+        "📐 CV自動編集",
+        type="primary",
+        use_container_width=True,
+    )
 
-    # ---- CV処理（+ AI微調整） ----
+    # ---- CV処理 ----
     if cv_clicked:
         progress = st.progress(0, text="OpenCV処理中...")
 
         result_panels = []
         for i, img in enumerate(images):
             progress.progress(
-                int((i / NUM_PANELS) * 40),
+                int((i / NUM_PANELS) * 60),
                 text=f"写真 {i+1}/5 を解析中...",
             )
             cv_result = cv_detect_crop(img, rotation_deg=default_rotation)
@@ -922,60 +544,14 @@ def main():
                 "zoom_boost": cv_result.get("zoom_boost", 2.0),
             })
 
-        progress.progress(40, text="CV処理完了。合成中...")
+        result = {"panels": result_panels}
+        st.session_state["cv_result"] = result
+
+        progress.progress(60, text="画像合成中...")
 
         out_w, out_h = output_size
         panel_w = out_w // NUM_PANELS
 
-        # CV結果で仮合成
-        cv_panels = []
-        for i, panel_data in enumerate(result_panels):
-            panel = process_single_panel(
-                images[i],
-                panel_data["rotation_cw_deg"],
-                panel_data["crop"],
-                panel_w,
-                out_h,
-                zoom_boost=panel_data.get("zoom_boost", 2.0),
-            )
-            cv_panels.append(panel)
-
-        logo_img = None
-        if logo_file is not None:
-            logo_img = Image.open(logo_file)
-        mode = "clinic" if output_mode == "医院名フッター" else "sns"
-
-        cv_composite = compose_panels(
-            cv_panels, output_size, mode=mode,
-            clinic_name=clinic_name, sns_handle=sns_handle, logo_img=logo_img,
-        )
-
-        # AI微調整（APIキーがあれば実行）
-        ref_path = REFERENCE_DIR / "1.png"
-        ai_adjustments = None
-        ai_raw = ""
-        if api_key and ref_path.exists():
-            progress.progress(50, text="AI微調整中（完成形と比較）...")
-            client = anthropic.Anthropic(api_key=api_key)
-            ai_adjustments, ai_raw = ai_refine_panels(client, cv_composite, ref_path)
-            if ai_adjustments:
-                progress.progress(70, text="AI微調整を適用中...")
-                result_panels = apply_ai_adjustments(result_panels, ai_adjustments)
-                st.session_state["raw_response"] = f"CV処理 + AI微調整\n\n{ai_raw}"
-            else:
-                st.warning("AI微調整の解析に失敗。CV結果のみ使用します。")
-                st.session_state["raw_response"] = f"CV処理のみ（AI失敗）\n\n{ai_raw}"
-        else:
-            if not api_key:
-                st.info("💡 APIキーを設定するとAI微調整で精度が向上します")
-            st.session_state["raw_response"] = "OpenCV処理（AI未使用）"
-
-        result = {"panels": result_panels}
-        st.session_state["ai_result"] = result
-
-        progress.progress(75, text="最終合成中...")
-
-        # 最終合成（AI調整後 or CV結果そのまま）
         processed_panels = []
         for i, panel_data in enumerate(result_panels):
             panel = process_single_panel(
@@ -988,7 +564,7 @@ def main():
             )
             processed_panels.append(panel)
             progress.progress(
-                75 + int((i + 1) / NUM_PANELS * 15),
+                60 + int((i + 1) / NUM_PANELS * 25),
                 text=f"写真 {i+1}/5 処理完了",
             )
 
@@ -1000,104 +576,6 @@ def main():
             debug_img = cv_create_debug_image(img, result_panels[i]["rotation_cw_deg"])
             debug_images.append(debug_img)
         st.session_state["cv_debug_images"] = debug_images
-
-        if logo_file is not None:
-            logo_file.seek(0)
-            logo_img = Image.open(logo_file)
-        composite = compose_panels(
-            processed_panels, output_size, mode=mode,
-            clinic_name=clinic_name, sns_handle=sns_handle, logo_img=logo_img,
-        )
-        st.session_state["composite"] = composite
-        progress.progress(100, text="完成！")
-
-    # ---- AI分析 & 合成 ----
-    if ai_clicked:
-        if not api_key:
-            st.error("サイドバーでAPIキーを入力してください")
-            return
-
-        client = anthropic.Anthropic(api_key=api_key)
-        progress = st.progress(0, text="Step 1: 回転角度を分析中...")
-
-        # Step 1: 回転角度を取得
-        rotations, step1_raw = step1_get_rotations(client, images, PHOTO_DESCRIPTIONS)
-        if rotations is None:
-            st.error("回転角度の分析に失敗しました。")
-            with st.expander("API応答（デバッグ用）"):
-                st.code(step1_raw)
-            return
-
-        progress.progress(15, text="Step 1完了: 回転中...")
-
-        # 回転実行
-        rotated_images = []
-        for i, img in enumerate(images):
-            rot_img = fix_orientation(img)
-            if abs(rotations[i]) > 0.1:
-                rot_img = rot_img.rotate(-rotations[i], expand=True, resample=Image.BICUBIC)
-            rotated_images.append(rot_img)
-
-        progress.progress(25, text="Step 2: クロップ範囲を分析中...")
-
-        # Step 2: 回転済み画像からクロップ座標を取得（1枚ずつ）
-        ref_images = load_reference_images()
-        cropped_refs = load_cropped_references()
-        all_raw = [step1_raw]
-
-        result_panels = []
-        for i, rot_img in enumerate(rotated_images):
-            progress.progress(
-                25 + int((i / NUM_PANELS) * 50),
-                text=f"Step 2: 写真 {i+1}/5 のクロップを分析中...",
-            )
-            crop_result, step2_raw = step2_get_crop(
-                client, rot_img, PHOTO_DESCRIPTIONS[i], ref_images, cropped_refs
-            )
-            all_raw.append(f"写真{i+1}: {step2_raw}")
-
-            if crop_result and "crop" in crop_result:
-                result_panels.append({
-                    "index": i + 1,
-                    "rotation_cw_deg": rotations[i],
-                    "crop": crop_result["crop"],
-                })
-            else:
-                st.warning(f"写真{i+1}のクロップ分析失敗（デフォルト使用）")
-                result_panels.append({
-                    "index": i + 1,
-                    "rotation_cw_deg": rotations[i],
-                    "crop": {"x0": 0.3, "y0": 0.2, "x1": 0.7, "y1": 0.8},
-                })
-
-        result = {"panels": result_panels}
-        raw_response = "\n---\n".join(all_raw)
-
-        st.session_state["ai_result"] = result
-        st.session_state["raw_response"] = raw_response
-
-        progress.progress(80, text="画像処理中...")
-
-        out_w, out_h = output_size
-        panel_w = out_w // NUM_PANELS
-
-        processed_panels = []
-        for i, panel_data in enumerate(result["panels"]):
-            panel = process_single_panel(
-                images[i],
-                panel_data["rotation_cw_deg"],
-                panel_data["crop"],
-                panel_w,
-                out_h,
-                zoom_boost=panel_data.get("zoom_boost", 1.0),
-            )
-            processed_panels.append(panel)
-            progress.progress(
-                80 + int((i + 1) / NUM_PANELS * 15),
-                text=f"写真 {i+1}/5 処理完了",
-            )
-
-        st.session_state["processed_panels"] = processed_panels
 
         logo_img = None
         if logo_file is not None:
@@ -1146,8 +624,8 @@ def main():
         with st.expander("🔧 手動微調整", expanded=True):
             st.caption("スライダーを動かすと即座にプレビューが更新されます")
 
-            if "ai_result" in st.session_state:
-                ai_result = st.session_state["ai_result"]
+            if "cv_result" in st.session_state:
+                cv_result = st.session_state["cv_result"]
                 out_w, out_h = output_size
                 panel_w = out_w // NUM_PANELS
 
@@ -1160,7 +638,7 @@ def main():
 
                 adjusted_panels = []
                 adjusted_panels_data = []
-                for i, panel_data in enumerate(ai_result["panels"]):
+                for i, panel_data in enumerate(cv_result["panels"]):
                     st.markdown(f"**{PHOTO_LABELS[i]}**")
                     c1, c2, c3, c4 = st.columns(4)
                     with c1:
@@ -1244,7 +722,7 @@ def main():
 
                     # 比較ログ作成
                     comparison_rows = []
-                    for i, (orig, adj) in enumerate(zip(ai_result["panels"], adjusted_panels_data)):
+                    for i, (orig, adj) in enumerate(zip(cv_result["panels"], adjusted_panels_data)):
                         orig_cx = (orig["crop"]["x0"] + orig["crop"]["x1"]) / 2
                         orig_cy = (orig["crop"]["y0"] + orig["crop"]["y1"]) / 2
                         adj_cx = (adj["crop"]["x0"] + adj["crop"]["x1"]) / 2
@@ -1254,16 +732,16 @@ def main():
                         zoom_val = orig_cw / adj_cw if adj_cw > 0 else 1.0
                         comparison_rows.append({
                             "写真": PHOTO_LABELS[i],
-                            "回転(AI)": f"{orig['rotation_cw_deg']:.1f}",
+                            "回転(CV)": f"{orig['rotation_cw_deg']:.1f}",
                             "回転(手動)": f"{adj['rotation_cw_deg']:.1f}",
-                            "X中心(AI)": f"{orig_cx:.2f}",
+                            "X中心(CV)": f"{orig_cx:.2f}",
                             "X中心(手動)": f"{adj_cx:.2f}",
-                            "Y中心(AI)": f"{orig_cy:.2f}",
+                            "Y中心(CV)": f"{orig_cy:.2f}",
                             "Y中心(手動)": f"{adj_cy:.2f}",
                             "ズーム": f"{zoom_val:.2f}",
                         })
                     comparison_json = json.dumps({
-                        "ai_original": ai_result["panels"],
+                        "cv_original": cv_result["panels"],
                         "manual_adjusted": adjusted_panels_data,
                         "comparison": comparison_rows,
                     }, ensure_ascii=False, indent=2)
@@ -1297,10 +775,8 @@ def main():
 
         # ---- デバッグ ----
         with st.expander("🐛 分析結果（デバッグ用）", expanded=False):
-            if "ai_result" in st.session_state:
-                st.json(st.session_state["ai_result"])
-            if "raw_response" in st.session_state:
-                st.code(st.session_state["raw_response"], language="json")
+            if "cv_result" in st.session_state:
+                st.json(st.session_state["cv_result"])
 
 
 if __name__ == "__main__":
