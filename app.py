@@ -5,6 +5,8 @@ OpenCV自動処理 → 手動微調整 → 5パネル合成
 from __future__ import annotations
 
 import streamlit as st
+import streamlit.components.v1 as components
+import base64
 import json
 import io
 import cv2
@@ -434,6 +436,188 @@ def _draw_sns_overlay(
 
 
 # ============================================================
+# ドラッグ編集エディタ
+# ============================================================
+def _img_to_data_url(img: Image.Image, quality: int = 80) -> str:
+    """PIL Image → base64 data URL"""
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def generate_editor_source(
+    img_pil: Image.Image,
+    rotation_deg: float,
+    crop: dict,
+    zoom_boost: float = 1.0,
+    target_w: int = 768,
+    target_h: int = 2160,
+) -> Image.Image:
+    """CV結果の2倍範囲をカバーするソース画像を生成（ドラッグ余白用）"""
+    img = fix_orientation(img_pil)
+    if abs(rotation_deg) > 0.1:
+        img = img.rotate(-rotation_deg, expand=True, resample=Image.BICUBIC)
+    if zoom_boost > 1.0:
+        crop = boost_crop(crop, zoom_boost)
+
+    w, h = img.size
+    cx = (crop["x0"] + crop["x1"]) / 2
+    cy = (crop["y0"] + crop["y1"]) / 2
+    cw = crop["x1"] - crop["x0"]
+    ch = crop["y1"] - crop["y0"]
+
+    target_ratio = target_w / target_h
+    crop_w = cw * 2
+    crop_h = ch * 2
+    if crop_w / max(crop_h, 0.001) > target_ratio:
+        crop_h = crop_w / target_ratio
+    else:
+        crop_w = crop_h * target_ratio
+
+    x0 = max(0, int((cx - crop_w / 2) * w))
+    y0 = max(0, int((cy - crop_h / 2) * h))
+    x1 = min(w, int((cx + crop_w / 2) * w))
+    y1 = min(h, int((cy + crop_h / 2) * h))
+
+    cropped = img.crop((x0, y0, x1, y1))
+    return ImageOps.fit(cropped, (target_w, target_h), method=Image.BICUBIC)
+
+
+def build_editor_html(
+    source_data_urls: list[str],
+    labels: list[str],
+    output_w: int = 1920,
+    output_h: int = 1080,
+    footer_text: str = "",
+    footer_mode: str = "clinic",
+    sns_handle: str = "",
+) -> str:
+    """ドラッグ＆ズーム可能な5パネルエディタのHTML/JSを生成"""
+    num = len(source_data_urls)
+    panel_w = output_w // num
+    vp_w = 150
+    vp_h = int(vp_w * output_h / panel_w)
+    src_w, src_h = 768, 2160
+
+    panels_js = json.dumps([
+        {"src": url, "label": lbl}
+        for url, lbl in zip(source_data_urls, labels)
+    ])
+
+    footer_text_escaped = footer_text.replace("'", "\\'").replace('"', '\\"')
+    sns_handle_escaped = sns_handle.replace("'", "\\'").replace('"', '\\"')
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;-webkit-user-select:none;user-select:none}}
+.wrap{{padding:8px}}
+.editor{{display:flex;gap:3px;justify-content:center;margin:8px 0}}
+.panel-col{{display:flex;flex-direction:column;align-items:center}}
+.vp{{width:{vp_w}px;height:{vp_h}px;overflow:hidden;position:relative;cursor:grab;border:1px solid #444;border-radius:3px}}
+.vp:active{{cursor:grabbing}}
+.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none}}
+.lbl{{font-size:10px;color:#999;margin-top:3px;text-align:center}}
+.btns{{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}}
+.btn{{padding:10px 24px;font-size:15px;font-weight:bold;border:none;border-radius:6px;cursor:pointer;color:#fff}}
+.btn-dl{{background:#ff4b4b}}.btn-dl:hover{{background:#e03e3e}}
+.btn-reset{{background:#555}}.btn-reset:hover{{background:#666}}
+.hint{{text-align:center;color:#888;font-size:12px;margin:4px 0}}
+</style></head><body><div class="wrap">
+<div class="hint">ドラッグで移動 ／ ホイールでズーム</div>
+<div class="editor" id="ed"></div>
+<div class="btns">
+<button class="btn btn-dl" onclick="dl('png')">📥 PNG ダウンロード</button>
+<button class="btn btn-dl" onclick="dl('webp')">📥 WebP ダウンロード</button>
+<button class="btn btn-reset" onclick="resetAll()">🔄 リセット</button>
+</div></div>
+<canvas id="cv" style="display:none"></canvas>
+<script>
+const P={panels_js};
+const VW={vp_w},VH={vp_h},OW={output_w},OH={output_h},PW={panel_w},SW={src_w},SH={src_h};
+const S=[];
+function init(){{
+const ed=document.getElementById('ed');
+P.forEach((p,i)=>{{
+const col=document.createElement('div');col.className='panel-col';
+const vp=document.createElement('div');vp.className='vp';
+const img=new Image();img.src=p.src;img.draggable=false;
+const bw=VW*2,bh=VH*2;
+img.style.width=bw+'px';img.style.height=bh+'px';
+img.style.left=-(bw-VW)/2+'px';img.style.top=-(bh-VH)/2+'px';
+vp.appendChild(img);
+const lbl=document.createElement('div');lbl.className='lbl';lbl.textContent=p.label;
+col.appendChild(vp);col.appendChild(lbl);ed.appendChild(col);
+const st={{img,ox:-(bw-VW)/2,oy:-(bh-VH)/2,sc:1,bw,bh,initOx:-(bw-VW)/2,initOy:-(bh-VH)/2}};
+S.push(st);
+let drag=false,sx,sy,sox,soy;
+vp.addEventListener('mousedown',e=>{{drag=true;sx=e.clientX;sy=e.clientY;sox=st.ox;soy=st.oy;e.preventDefault()}});
+vp.addEventListener('touchstart',e=>{{if(e.touches.length===1){{drag=true;sx=e.touches[0].clientX;sy=e.touches[0].clientY;sox=st.ox;soy=st.oy;e.preventDefault()}}}},{{passive:false}});
+const onMove=(cx,cy)=>{{if(!drag)return;st.ox=sox+(cx-sx);st.oy=soy+(cy-sy);img.style.left=st.ox+'px';img.style.top=st.oy+'px'}};
+document.addEventListener('mousemove',e=>onMove(e.clientX,e.clientY));
+document.addEventListener('touchmove',e=>{{if(drag&&e.touches.length===1){{onMove(e.touches[0].clientX,e.touches[0].clientY);e.preventDefault()}}}},{{passive:false}});
+document.addEventListener('mouseup',()=>{{drag=false}});
+document.addEventListener('touchend',()=>{{drag=false}});
+vp.addEventListener('wheel',e=>{{
+e.preventDefault();
+const zf=e.deltaY>0?0.93:1.07;
+const ns=Math.max(0.4,Math.min(3,st.sc*zf));
+const vcx=VW/2,vcy=VH/2;
+const icx=(vcx-st.ox)/(st.bw*st.sc)*(st.bw*ns);
+const icy=(vcy-st.oy)/(st.bh*st.sc)*(st.bh*ns);
+st.sc=ns;st.ox=vcx-icx;st.oy=vcy-icy;
+img.style.width=(st.bw*ns)+'px';img.style.height=(st.bh*ns)+'px';
+img.style.left=st.ox+'px';img.style.top=st.oy+'px';
+}},{{passive:false}});
+}});
+}}
+function render(){{
+const c=document.getElementById('cv');c.width=OW;c.height=OH;
+const ctx=c.getContext('2d');
+ctx.fillStyle='#0f0f0f';ctx.fillRect(0,0,OW,OH);
+S.forEach((s,i)=>{{
+const cw=s.bw*s.sc,ch=s.bh*s.sc;
+const rx=SW/cw,ry=SH/ch;
+const sx_=(-s.ox)*rx,sy_=(-s.oy)*ry,sw_=VW*rx,sh_=VH*ry;
+ctx.drawImage(s.img,sx_,sy_,sw_,sh_,i*PW,0,PW,OH);
+}});
+const fm='{footer_mode}';
+if(fm==='clinic'&&'{footer_text_escaped}'){{
+const fh=Math.round(OH*0.08),fy=OH-fh;
+ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,fy,OW,fh);
+ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(0,fy);ctx.lineTo(OW,fy);ctx.stroke();
+const fs=Math.round(fh*0.6);
+ctx.font=fs+'px "Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans CJK JP","Meiryo",sans-serif';
+ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
+ctx.fillText('{footer_text_escaped}',OW/2,fy+fh/2);
+}}else if(fm==='sns'){{
+const fs=Math.round(OH*0.03);
+ctx.font=fs+'px "Hiragino Kaku Gothic ProN",sans-serif';
+ctx.fillStyle='rgba(255,255,255,0.85)';ctx.textAlign='right';ctx.textBaseline='bottom';
+ctx.fillText('{sns_handle_escaped}',OW-20,OH-20);
+}}
+return c;
+}}
+function dl(fmt){{
+const c=render();const a=document.createElement('a');
+if(fmt==='webp'){{a.download='case_composite.webp';a.href=c.toDataURL('image/webp',0.92)}}
+else{{a.download='case_composite.png';a.href=c.toDataURL('image/png')}}
+a.click();
+}}
+function resetAll(){{
+S.forEach(s=>{{
+s.sc=1;s.ox=s.initOx;s.oy=s.initOy;
+s.img.style.width=s.bw+'px';s.img.style.height=s.bh+'px';
+s.img.style.left=s.ox+'px';s.img.style.top=s.oy+'px';
+}});
+}}
+init();
+</script></body></html>"""
+
+
+# ============================================================
 # Streamlit UI
 # ============================================================
 def main():
@@ -527,6 +711,8 @@ def main():
 
     # ---- CV処理 ----
     if cv_clicked:
+        # 前回のエディタソースをクリア
+        st.session_state.pop("editor_sources", None)
         progress = st.progress(0, text="OpenCV処理中...")
 
         result_panels = []
@@ -593,177 +779,36 @@ def main():
         st.session_state["composite"] = composite
         progress.progress(100, text="完成！")
 
-    # ---- 結果表示 ----
-    if "composite" in st.session_state:
-        st.subheader("🎨 合成結果")
-        st.image(st.session_state["composite"], use_container_width=True)
+    # ---- ドラッグ編集エディタ ----
+    if "cv_result" in st.session_state:
+        cv_result = st.session_state["cv_result"]
+        st.subheader("🎨 ドラッグで微調整 → ダウンロード")
 
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            buf_png = io.BytesIO()
-            st.session_state["composite"].save(buf_png, format="PNG")
-            st.download_button(
-                "📥 PNG ダウンロード",
-                data=buf_png.getvalue(),
-                file_name="case_composite.png",
-                mime="image/png",
-                use_container_width=True,
-            )
-        with col_dl2:
-            buf_webp = io.BytesIO()
-            st.session_state["composite"].save(buf_webp, format="WEBP", quality=90)
-            st.download_button(
-                "📥 WebP ダウンロード",
-                data=buf_webp.getvalue(),
-                file_name="case_composite.webp",
-                mime="image/webp",
-                use_container_width=True,
-            )
-
-        # ---- 手動微調整（リアルタイムプレビュー） ----
-        with st.expander("🔧 手動微調整", expanded=True):
-            st.caption("スライダーを動かすと即座にプレビューが更新されます")
-
-            if "cv_result" in st.session_state:
-                cv_result = st.session_state["cv_result"]
-                out_w, out_h = output_size
-                panel_w = out_w // NUM_PANELS
-
-                # 参考画像を表示
-                ref_path = Path(__file__).parent / "reference" / "1.png"
-                if ref_path.exists():
-                    st.markdown("**📌 完成形（参考）**")
-                    st.image(str(ref_path), use_container_width=True)
-                    st.divider()
-
-                adjusted_panels = []
-                adjusted_panels_data = []
-                for i, panel_data in enumerate(cv_result["panels"]):
-                    st.markdown(f"**{PHOTO_LABELS[i]}**")
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        rot = st.number_input(
-                            "回転 (°)",
-                            value=float(panel_data["rotation_cw_deg"]),
-                            min_value=-180.0,
-                            max_value=180.0,
-                            step=0.5,
-                            key=f"rot_{i}",
-                        )
-                    with c2:
-                        cx = st.slider(
-                            "X中心",
-                            0.0, 1.0,
-                            value=(panel_data["crop"]["x0"] + panel_data["crop"]["x1"]) / 2,
-                            step=0.01,
-                            key=f"cx_{i}",
-                        )
-                    with c3:
-                        cy = st.slider(
-                            "Y中心",
-                            0.0, 1.0,
-                            value=(panel_data["crop"]["y0"] + panel_data["crop"]["y1"]) / 2,
-                            step=0.01,
-                            key=f"cy_{i}",
-                        )
-                    with c4:
-                        zoom = st.slider(
-                            "ズーム",
-                            0.5, 2.0,
-                            value=1.0,
-                            step=0.05,
-                            key=f"zoom_{i}",
-                        )
-
-                    orig_w = panel_data["crop"]["x1"] - panel_data["crop"]["x0"]
-                    orig_h = panel_data["crop"]["y1"] - panel_data["crop"]["y0"]
-                    new_w = orig_w / zoom
-                    new_h = orig_h / zoom
-                    adj_crop = {
-                        "x0": max(0.0, cx - new_w / 2),
-                        "y0": max(0.0, cy - new_h / 2),
-                        "x1": min(1.0, cx + new_w / 2),
-                        "y1": min(1.0, cy + new_h / 2),
-                    }
-                    adjusted_panels_data.append({
-                        "rotation_cw_deg": rot,
-                        "crop": adj_crop,
-                    })
-
-                    # リアルタイムパネルプレビュー
-                    panel_img = process_single_panel(
-                        images[i], rot, adj_crop, panel_w, out_h,
-                    )
-                    adjusted_panels.append(panel_img)
-                    st.image(panel_img, caption=f"プレビュー: {PHOTO_LABELS[i]}", width=120)
-                    st.divider()
-
-                # リアルタイム合成プレビュー
-                st.markdown("**🖼️ 合成プレビュー**")
-                logo_img = None
-                if logo_file is not None:
-                    logo_file.seek(0)
-                    logo_img = Image.open(logo_file)
-                mode = "clinic" if output_mode == "医院名フッター" else "sns"
-                live_composite = compose_panels(
-                    adjusted_panels,
-                    output_size,
-                    mode=mode,
-                    clinic_name=clinic_name,
-                    sns_handle=sns_handle,
-                    logo_img=logo_img,
+        # エディタ用ソース画像を生成（キャッシュ）
+        if "editor_sources" not in st.session_state:
+            sources = []
+            for i, panel_data in enumerate(cv_result["panels"]):
+                src = generate_editor_source(
+                    images[i],
+                    panel_data["rotation_cw_deg"],
+                    panel_data["crop"],
+                    zoom_boost=panel_data.get("zoom_boost", 2.0),
                 )
-                st.image(live_composite, use_container_width=True)
+                sources.append(_img_to_data_url(src))
+            st.session_state["editor_sources"] = sources
 
-                # 適用ボタン: session_stateに保存してDLボタン等に反映
-                if st.button("✅ この結果を確定", use_container_width=True):
-                    st.session_state["composite"] = live_composite
-                    st.session_state["processed_panels"] = adjusted_panels
-
-                    # 比較ログ作成
-                    comparison_rows = []
-                    for i, (orig, adj) in enumerate(zip(cv_result["panels"], adjusted_panels_data)):
-                        orig_cx = (orig["crop"]["x0"] + orig["crop"]["x1"]) / 2
-                        orig_cy = (orig["crop"]["y0"] + orig["crop"]["y1"]) / 2
-                        adj_cx = (adj["crop"]["x0"] + adj["crop"]["x1"]) / 2
-                        adj_cy = (adj["crop"]["y0"] + adj["crop"]["y1"]) / 2
-                        orig_cw = orig["crop"]["x1"] - orig["crop"]["x0"]
-                        adj_cw = adj["crop"]["x1"] - adj["crop"]["x0"]
-                        zoom_val = orig_cw / adj_cw if adj_cw > 0 else 1.0
-                        comparison_rows.append({
-                            "写真": PHOTO_LABELS[i],
-                            "回転(CV)": f"{orig['rotation_cw_deg']:.1f}",
-                            "回転(手動)": f"{adj['rotation_cw_deg']:.1f}",
-                            "X中心(CV)": f"{orig_cx:.2f}",
-                            "X中心(手動)": f"{adj_cx:.2f}",
-                            "Y中心(CV)": f"{orig_cy:.2f}",
-                            "Y中心(手動)": f"{adj_cy:.2f}",
-                            "ズーム": f"{zoom_val:.2f}",
-                        })
-                    comparison_json = json.dumps({
-                        "cv_original": cv_result["panels"],
-                        "manual_adjusted": adjusted_panels_data,
-                        "comparison": comparison_rows,
-                    }, ensure_ascii=False, indent=2)
-                    st.session_state["adjustment_log"] = {
-                        "comparison": comparison_rows,
-                        "json": comparison_json,
-                    }
-                    st.rerun()
-
-        # ---- 調整ログ ----
-        if "adjustment_log" in st.session_state:
-            with st.expander("📊 最新の調整ログ", expanded=False):
-                st.table(st.session_state["adjustment_log"]["comparison"])
-                st.download_button(
-                    "📋 比較ログをJSONでコピー",
-                    data=st.session_state["adjustment_log"]["json"],
-                    file_name="adjustment_log.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    key="dl_adj_log",
-                )
-                st.code(st.session_state["adjustment_log"]["json"], language="json")
+        mode = "clinic" if output_mode == "医院名フッター" else "sns"
+        out_w, out_h = output_size
+        html = build_editor_html(
+            source_data_urls=st.session_state["editor_sources"],
+            labels=PHOTO_LABELS,
+            output_w=out_w,
+            output_h=out_h,
+            footer_text=clinic_name if mode == "clinic" else "",
+            footer_mode=mode,
+            sns_handle=sns_handle,
+        )
+        components.html(html, height=580, scrolling=False)
 
         # ---- CVデバッグ ----
         if "cv_debug_images" in st.session_state:
