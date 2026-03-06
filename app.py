@@ -454,22 +454,29 @@ def generate_editor_source(
     target_w: int = 768,
     target_h: int = 2160,
 ) -> Image.Image:
-    """CV結果の2倍範囲をカバーするソース画像を生成（ドラッグ余白用）"""
+    """CV結果に上下左右40%マージンを追加したソース画像を生成（ドラッグ余白用）
+
+    zoom_boost適用前のCV cropを基準に、十分な余白を確保する。
+    JSエディタではこの画像の中央部分がデフォルト表示位置になる。
+    """
     img = fix_orientation(img_pil)
     if abs(rotation_deg) > 0.1:
         img = img.rotate(-rotation_deg, expand=True, resample=Image.BICUBIC)
-    if zoom_boost > 1.0:
-        crop = boost_crop(crop, zoom_boost)
 
+    # zoom_boost適用前のCVクロップを基準にする（広い範囲）
     w, h = img.size
     cx = (crop["x0"] + crop["x1"]) / 2
     cy = (crop["y0"] + crop["y1"]) / 2
     cw = crop["x1"] - crop["x0"]
     ch = crop["y1"] - crop["y0"]
 
+    # CV cropの上下左右に40%マージンを追加（zoom_boost前の広い範囲が基準）
+    margin = 0.4
+    crop_w = cw * (1 + margin * 2)
+    crop_h = ch * (1 + margin * 2)
+
+    # アスペクト比をターゲットに合わせる
     target_ratio = target_w / target_h
-    crop_w = cw * 2
-    crop_h = ch * 2
     if crop_w / max(crop_h, 0.001) > target_ratio:
         crop_h = crop_w / target_ratio
     else:
@@ -487,6 +494,7 @@ def generate_editor_source(
 def build_editor_html(
     source_data_urls: list[str],
     labels: list[str],
+    zoom_boosts: list[float],
     output_w: int = 1920,
     output_h: int = 1080,
     footer_text: str = "",
@@ -500,9 +508,14 @@ def build_editor_html(
     vp_h = int(vp_w * output_h / panel_w)
     src_w, src_h = 768, 2160
 
+    # 各パネルの初期ズーム倍率を計算
+    # ソースはCV crop + 40%マージン(=1.8倍)をカバー
+    # 最終表示はzoom_boost適用後のcrop
+    # → 画像CSSサイズ = viewport × zoom_boost × 1.8
+    margin_factor = 1.8  # 1 + 0.4*2
     panels_js = json.dumps([
-        {"src": url, "label": lbl}
-        for url, lbl in zip(source_data_urls, labels)
+        {"src": url, "label": lbl, "initScale": round(zb * margin_factor, 2)}
+        for url, lbl, zb in zip(source_data_urls, labels, zoom_boosts)
     ])
 
     footer_text_escaped = footer_text.replace("'", "\\'").replace('"', '\\"')
@@ -517,15 +530,18 @@ body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;-webkit
 .panel-col{{display:flex;flex-direction:column;align-items:center}}
 .vp{{width:{vp_w}px;height:{vp_h}px;overflow:hidden;position:relative;cursor:grab;border:1px solid #444;border-radius:3px}}
 .vp:active{{cursor:grabbing}}
-.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none}}
-.lbl{{font-size:10px;color:#999;margin-top:3px;text-align:center}}
+.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none;transform-origin:center center}}
+.lbl{{font-size:10px;color:#999;margin-top:2px;text-align:center}}
+.rot-btns{{display:flex;gap:2px;margin-top:2px}}
+.rot-btn{{background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:1px 5px;font-size:10px;cursor:pointer}}
+.rot-btn:hover{{background:#555}}
 .btns{{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}}
 .btn{{padding:10px 24px;font-size:15px;font-weight:bold;border:none;border-radius:6px;cursor:pointer;color:#fff}}
 .btn-dl{{background:#ff4b4b}}.btn-dl:hover{{background:#e03e3e}}
 .btn-reset{{background:#555}}.btn-reset:hover{{background:#666}}
 .hint{{text-align:center;color:#888;font-size:12px;margin:4px 0}}
 </style></head><body><div class="wrap">
-<div class="hint">ドラッグで移動 ／ ホイールでズーム</div>
+<div class="hint">ドラッグ=移動 ／ ホイール=ズーム ／ 下のボタン=回転</div>
 <div class="editor" id="ed"></div>
 <div class="btns">
 <button class="btn btn-dl" onclick="dl('png')">📥 PNG ダウンロード</button>
@@ -537,24 +553,37 @@ body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;-webkit
 const P={panels_js};
 const VW={vp_w},VH={vp_h},OW={output_w},OH={output_h},PW={panel_w},SW={src_w},SH={src_h};
 const S=[];
+function applyTransform(s){{
+const w=s.bw*s.sc,h=s.bh*s.sc;
+s.img.style.width=w+'px';s.img.style.height=h+'px';
+s.img.style.left=s.ox+'px';s.img.style.top=s.oy+'px';
+s.img.style.transform='rotate('+s.rot+'deg)';
+}}
 function init(){{
 const ed=document.getElementById('ed');
 P.forEach((p,i)=>{{
 const col=document.createElement('div');col.className='panel-col';
 const vp=document.createElement('div');vp.className='vp';
 const img=new Image();img.src=p.src;img.draggable=false;
-const bw=VW*2,bh=VH*2;
+const isc=p.initScale||2;
+const bw=VW*isc,bh=VH*isc;
 img.style.width=bw+'px';img.style.height=bh+'px';
 img.style.left=-(bw-VW)/2+'px';img.style.top=-(bh-VH)/2+'px';
 vp.appendChild(img);
 const lbl=document.createElement('div');lbl.className='lbl';lbl.textContent=p.label;
-col.appendChild(vp);col.appendChild(lbl);ed.appendChild(col);
-const st={{img,ox:-(bw-VW)/2,oy:-(bh-VH)/2,sc:1,bw,bh,initOx:-(bw-VW)/2,initOy:-(bh-VH)/2}};
+col.appendChild(vp);col.appendChild(lbl);
+const rotDiv=document.createElement('div');rotDiv.className='rot-btns';
+[[-5,'−5°'],[-1,'−1°'],[1,'+1°'],[5,'+5°']].forEach(([deg,txt])=>{{
+const b=document.createElement('button');b.className='rot-btn';b.textContent=txt;
+b.onclick=()=>{{S[i].rot+=deg;applyTransform(S[i])}};rotDiv.appendChild(b);
+}});
+col.appendChild(rotDiv);ed.appendChild(col);
+const st={{img,ox:-(bw-VW)/2,oy:-(bh-VH)/2,sc:1,rot:0,bw,bh,initOx:-(bw-VW)/2,initOy:-(bh-VH)/2}};
 S.push(st);
 let drag=false,sx,sy,sox,soy;
 vp.addEventListener('mousedown',e=>{{drag=true;sx=e.clientX;sy=e.clientY;sox=st.ox;soy=st.oy;e.preventDefault()}});
 vp.addEventListener('touchstart',e=>{{if(e.touches.length===1){{drag=true;sx=e.touches[0].clientX;sy=e.touches[0].clientY;sox=st.ox;soy=st.oy;e.preventDefault()}}}},{{passive:false}});
-const onMove=(cx,cy)=>{{if(!drag)return;st.ox=sox+(cx-sx);st.oy=soy+(cy-sy);img.style.left=st.ox+'px';img.style.top=st.oy+'px'}};
+const onMove=(cx,cy)=>{{if(!drag)return;st.ox=sox+(cx-sx);st.oy=soy+(cy-sy);applyTransform(st)}};
 document.addEventListener('mousemove',e=>onMove(e.clientX,e.clientY));
 document.addEventListener('touchmove',e=>{{if(drag&&e.touches.length===1){{onMove(e.touches[0].clientX,e.touches[0].clientY);e.preventDefault()}}}},{{passive:false}});
 document.addEventListener('mouseup',()=>{{drag=false}});
@@ -567,8 +596,7 @@ const vcx=VW/2,vcy=VH/2;
 const icx=(vcx-st.ox)/(st.bw*st.sc)*(st.bw*ns);
 const icy=(vcy-st.oy)/(st.bh*st.sc)*(st.bh*ns);
 st.sc=ns;st.ox=vcx-icx;st.oy=vcy-icy;
-img.style.width=(st.bw*ns)+'px';img.style.height=(st.bh*ns)+'px';
-img.style.left=st.ox+'px';img.style.top=st.oy+'px';
+applyTransform(st);
 }},{{passive:false}});
 }});
 }}
@@ -580,7 +608,25 @@ S.forEach((s,i)=>{{
 const cw=s.bw*s.sc,ch=s.bh*s.sc;
 const rx=SW/cw,ry=SH/ch;
 const sx_=(-s.ox)*rx,sy_=(-s.oy)*ry,sw_=VW*rx,sh_=VH*ry;
-ctx.drawImage(s.img,sx_,sy_,sw_,sh_,i*PW,0,PW,OH);
+/* panel x: use exact integer coords, last panel absorbs remainder */
+const px=(i===S.length-1)?OW-PW:i*PW;
+const pw=(i===S.length-1)?PW:PW+1; /* +1 overlap to kill sub-pixel gaps */
+ctx.save();
+ctx.beginPath();ctx.rect(px,0,pw,OH);ctx.clip();
+const pcx=px+PW/2,pcy=OH/2;
+if(Math.abs(s.rot)>0.01){{
+/* rotation: expand draw rect to cover corners */
+const rad=Math.abs(s.rot)*Math.PI/180;
+const exW=Math.ceil(PW*Math.abs(Math.cos(rad))+OH*Math.abs(Math.sin(rad)));
+const exH=Math.ceil(PW*Math.abs(Math.sin(rad))+OH*Math.abs(Math.cos(rad)));
+const exSx=sw_*(exW-PW)/(2*PW),exSy=sh_*(exH-OH)/(2*OH);
+ctx.translate(pcx,pcy);
+ctx.rotate(s.rot*Math.PI/180);
+ctx.drawImage(s.img,sx_-exSx,sy_-exSy,sw_+2*exSx,sh_+2*exSy,-exW/2,-exH/2,exW,exH);
+}}else{{
+ctx.drawImage(s.img,sx_,sy_,sw_,sh_,px,0,pw,OH);
+}}
+ctx.restore();
 }});
 const fm='{footer_mode}';
 if(fm==='clinic'&&'{footer_text_escaped}'){{
@@ -608,9 +654,8 @@ a.click();
 }}
 function resetAll(){{
 S.forEach(s=>{{
-s.sc=1;s.ox=s.initOx;s.oy=s.initOy;
-s.img.style.width=s.bw+'px';s.img.style.height=s.bh+'px';
-s.img.style.left=s.ox+'px';s.img.style.top=s.oy+'px';
+s.sc=1;s.rot=0;s.ox=s.initOx;s.oy=s.initOy;
+applyTransform(s);
 }});
 }}
 init();
@@ -713,6 +758,7 @@ def main():
     if cv_clicked:
         # 前回のエディタソースをクリア
         st.session_state.pop("editor_sources", None)
+        st.session_state.pop("editor_zooms", None)
         progress = st.progress(0, text="OpenCV処理中...")
 
         result_panels = []
@@ -787,21 +833,26 @@ def main():
         # エディタ用ソース画像を生成（キャッシュ）
         if "editor_sources" not in st.session_state:
             sources = []
+            zooms = []
             for i, panel_data in enumerate(cv_result["panels"]):
+                zb = panel_data.get("zoom_boost", 2.0)
                 src = generate_editor_source(
                     images[i],
                     panel_data["rotation_cw_deg"],
                     panel_data["crop"],
-                    zoom_boost=panel_data.get("zoom_boost", 2.0),
+                    zoom_boost=zb,
                 )
                 sources.append(_img_to_data_url(src))
+                zooms.append(zb)
             st.session_state["editor_sources"] = sources
+            st.session_state["editor_zooms"] = zooms
 
         mode = "clinic" if output_mode == "医院名フッター" else "sns"
         out_w, out_h = output_size
         html = build_editor_html(
             source_data_urls=st.session_state["editor_sources"],
             labels=PHOTO_LABELS,
+            zoom_boosts=st.session_state.get("editor_zooms", [2.0] * NUM_PANELS),
             output_w=out_w,
             output_h=out_h,
             footer_text=clinic_name if mode == "clinic" else "",
