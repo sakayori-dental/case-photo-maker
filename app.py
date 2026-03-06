@@ -1,5 +1,5 @@
 """
-歯科症例写真 自動合成アプリ v3.0
+歯科症例写真 自動合成アプリ v3.1
 OpenCV前処理 + オプションAI微調整 → 回転・クロップ・ズーム統一 → 5パネル合成
 """
 from __future__ import annotations
@@ -543,6 +543,117 @@ def load_cropped_references() -> list[dict]:
 
 
 # ============================================================
+# AI微調整（CV処理後の仕上げ）
+# ============================================================
+AI_REFINE_PROMPT = """あなたは歯科症例写真の構図調整エキスパートです。
+
+【タスク】
+CV処理済みの5パネル合成画像を「完成形」と比較して、各パネルの微調整値を返してください。
+
+【完成形の特徴】
+- 各パネルに臼歯3〜4本が縦方向にちょうど収まるサイズ
+- 歯冠がパネルの中央に位置し、歯冠占有率が70〜80%
+- 口唇・舌・器具・クランプは最小限（端で見切れる程度）
+- ラバーダム（青）は術中写真のみ少量が見える程度
+
+【返すべき値（各パネルごと）】
+- dx: X方向のクロップ中心の移動量（-0.10〜+0.10）。正=右、負=左
+- dy: Y方向のクロップ中心の移動量（-0.10〜+0.10）。正=下、負=上
+- zoom: ズーム倍率（0.80〜1.20）。1.0=変更なし、>1.0=拡大、<1.0=縮小
+
+【判断基準】
+- 完成形より歯が小さい → zoom > 1.0
+- 完成形より歯が大きい → zoom < 1.0
+- 歯列が上寄り → dy > 0（下に移動）
+- 歯列が下寄り → dy < 0（上に移動）
+- 歯列が左寄り → dx > 0（右に移動）
+- 歯列が右寄り → dx < 0（左に移動）
+- 調整不要なパネルは dx=0, dy=0, zoom=1.0 を返す
+
+【出力形式】JSONのみを返してください。説明文は不要です。
+{"adjustments": [
+  {"panel": 1, "dx": <float>, "dy": <float>, "zoom": <float>},
+  {"panel": 2, "dx": <float>, "dy": <float>, "zoom": <float>},
+  {"panel": 3, "dx": <float>, "dy": <float>, "zoom": <float>},
+  {"panel": 4, "dx": <float>, "dy": <float>, "zoom": <float>},
+  {"panel": 5, "dx": <float>, "dy": <float>, "zoom": <float>}
+]}
+"""
+
+
+def ai_refine_panels(
+    client: anthropic.Anthropic,
+    cv_composite: Image.Image,
+    ref_image_path: Path,
+) -> tuple[list[dict] | None, str]:
+    """CV処理済み合成画像を完成形と比較して微調整差分を取得"""
+    content = []
+
+    # 完成形（参考画像）
+    if ref_image_path.exists():
+        ref_img = Image.open(ref_image_path).convert("RGB")
+        ref_bytes = resize_for_api(ref_img, max_dim=1024)
+        content.append({"type": "text", "text": "【完成形（参考画像）】"})
+        content.append(image_to_base64(ref_bytes))
+
+    # CV処理済み合成画像
+    composite_bytes = resize_for_api(cv_composite, max_dim=1568)
+    content.append({"type": "text", "text": "【CV処理済み合成画像（調整対象）】"})
+    content.append(image_to_base64(composite_bytes))
+
+    content.append({"type": "text", "text": AI_REFINE_PROMPT})
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = response.content[0].text
+        result = extract_json_from_response(text)
+        if result and "adjustments" in result:
+            return result["adjustments"], text
+        return None, text
+    except Exception as e:
+        return None, str(e)
+
+
+def apply_ai_adjustments(
+    panels_data: list[dict],
+    adjustments: list[dict],
+) -> list[dict]:
+    """AI微調整差分をCV結果のパネルデータに適用"""
+    refined = []
+    for i, panel in enumerate(panels_data):
+        adj = adjustments[i] if i < len(adjustments) else {}
+        dx = float(adj.get("dx", 0))
+        dy = float(adj.get("dy", 0))
+        zoom = float(adj.get("zoom", 1.0))
+
+        # dx/dyの範囲を制限
+        dx = max(-0.10, min(0.10, dx))
+        dy = max(-0.10, min(0.10, dy))
+        zoom = max(0.80, min(1.20, zoom))
+
+        crop = panel["crop"]
+        cx = (crop["x0"] + crop["x1"]) / 2 + dx
+        cy = (crop["y0"] + crop["y1"]) / 2 + dy
+        hw = (crop["x1"] - crop["x0"]) / 2 / zoom
+        hh = (crop["y1"] - crop["y0"]) / 2 / zoom
+
+        refined.append({
+            **panel,
+            "crop": {
+                "x0": max(0.0, cx - hw),
+                "y0": max(0.0, cy - hh),
+                "x1": min(1.0, cx + hw),
+                "y1": min(1.0, cy + hh),
+            },
+        })
+    return refined
+
+
+# ============================================================
 # 画像処理
 # ============================================================
 def boost_crop(crop: dict, zoom: float) -> dict:
@@ -745,7 +856,7 @@ def main():
         )
 
         st.divider()
-        st.caption("v3.0 — OpenCV + Claude Vision AI")
+        st.caption("v3.1 — CV自動 + AI微調整")
 
     # ---- 写真アップロード ----
     st.subheader("📷 写真をアップロード（5枚まとめてドラッグ＆ドロップ可）")
@@ -782,7 +893,7 @@ def main():
     col_cv, col_ai = st.columns(2)
     with col_cv:
         cv_clicked = st.button(
-            "📐 CV自動編集（APIキー不要）",
+            "📐 CV自動編集（+AI微調整）",
             type="primary",
             use_container_width=True,
         )
@@ -792,14 +903,14 @@ def main():
             use_container_width=True,
         )
 
-    # ---- CV処理 ----
+    # ---- CV処理（+ AI微調整） ----
     if cv_clicked:
         progress = st.progress(0, text="OpenCV処理中...")
 
         result_panels = []
         for i, img in enumerate(images):
             progress.progress(
-                int((i / NUM_PANELS) * 70),
+                int((i / NUM_PANELS) * 40),
                 text=f"写真 {i+1}/5 を解析中...",
             )
             cv_result = cv_detect_crop(img, rotation_deg=default_rotation)
@@ -811,17 +922,62 @@ def main():
                 "zoom_boost": cv_result.get("zoom_boost", 2.0),
             })
 
-        result = {"panels": result_panels}
-        st.session_state["ai_result"] = result
-        st.session_state["raw_response"] = "OpenCV処理（AI未使用）"
-
-        progress.progress(70, text="画像合成中...")
+        progress.progress(40, text="CV処理完了。合成中...")
 
         out_w, out_h = output_size
         panel_w = out_w // NUM_PANELS
 
+        # CV結果で仮合成
+        cv_panels = []
+        for i, panel_data in enumerate(result_panels):
+            panel = process_single_panel(
+                images[i],
+                panel_data["rotation_cw_deg"],
+                panel_data["crop"],
+                panel_w,
+                out_h,
+                zoom_boost=panel_data.get("zoom_boost", 2.0),
+            )
+            cv_panels.append(panel)
+
+        logo_img = None
+        if logo_file is not None:
+            logo_img = Image.open(logo_file)
+        mode = "clinic" if output_mode == "医院名フッター" else "sns"
+
+        cv_composite = compose_panels(
+            cv_panels, output_size, mode=mode,
+            clinic_name=clinic_name, sns_handle=sns_handle, logo_img=logo_img,
+        )
+
+        # AI微調整（APIキーがあれば実行）
+        ref_path = REFERENCE_DIR / "1.png"
+        ai_adjustments = None
+        ai_raw = ""
+        if api_key and ref_path.exists():
+            progress.progress(50, text="AI微調整中（完成形と比較）...")
+            client = anthropic.Anthropic(api_key=api_key)
+            ai_adjustments, ai_raw = ai_refine_panels(client, cv_composite, ref_path)
+            if ai_adjustments:
+                progress.progress(70, text="AI微調整を適用中...")
+                result_panels = apply_ai_adjustments(result_panels, ai_adjustments)
+                st.session_state["raw_response"] = f"CV処理 + AI微調整\n\n{ai_raw}"
+            else:
+                st.warning("AI微調整の解析に失敗。CV結果のみ使用します。")
+                st.session_state["raw_response"] = f"CV処理のみ（AI失敗）\n\n{ai_raw}"
+        else:
+            if not api_key:
+                st.info("💡 APIキーを設定するとAI微調整で精度が向上します")
+            st.session_state["raw_response"] = "OpenCV処理（AI未使用）"
+
+        result = {"panels": result_panels}
+        st.session_state["ai_result"] = result
+
+        progress.progress(75, text="最終合成中...")
+
+        # 最終合成（AI調整後 or CV結果そのまま）
         processed_panels = []
-        for i, panel_data in enumerate(result["panels"]):
+        for i, panel_data in enumerate(result_panels):
             panel = process_single_panel(
                 images[i],
                 panel_data["rotation_cw_deg"],
@@ -832,7 +988,7 @@ def main():
             )
             processed_panels.append(panel)
             progress.progress(
-                70 + int((i + 1) / NUM_PANELS * 20),
+                75 + int((i + 1) / NUM_PANELS * 15),
                 text=f"写真 {i+1}/5 処理完了",
             )
 
@@ -845,18 +1001,12 @@ def main():
             debug_images.append(debug_img)
         st.session_state["cv_debug_images"] = debug_images
 
-        logo_img = None
         if logo_file is not None:
+            logo_file.seek(0)
             logo_img = Image.open(logo_file)
-
-        mode = "clinic" if output_mode == "医院名フッター" else "sns"
         composite = compose_panels(
-            processed_panels,
-            output_size,
-            mode=mode,
-            clinic_name=clinic_name,
-            sns_handle=sns_handle,
-            logo_img=logo_img,
+            processed_panels, output_size, mode=mode,
+            clinic_name=clinic_name, sns_handle=sns_handle, logo_img=logo_img,
         )
         st.session_state["composite"] = composite
         progress.progress(100, text="完成！")
