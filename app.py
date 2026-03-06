@@ -1,5 +1,5 @@
 """
-歯科症例写真 自動合成アプリ v3.2
+歯科症例写真 自動合成アプリ v3.5
 OpenCV自動処理 → 手動微調整 → 5パネル合成
 """
 from __future__ import annotations
@@ -501,18 +501,12 @@ def build_editor_html(
     footer_mode: str = "clinic",
     sns_handle: str = "",
 ) -> str:
-    """ドラッグ＆ズーム可能な5パネルエディタのHTML/JSを生成"""
+    """ドラッグ＆ズーム可能な5パネルエディタのHTML/JSを生成（レスポンシブ対応）"""
     num = len(source_data_urls)
     panel_w = output_w // num
-    vp_w = 150
-    vp_h = int(vp_w * output_h / panel_w)
     src_w, src_h = 768, 2160
 
-    # 各パネルの初期ズーム倍率を計算
-    # ソースはCV crop + 40%マージン(=1.8倍)をカバー
-    # 最終表示はzoom_boost適用後のcrop
-    # → 画像CSSサイズ = viewport × zoom_boost × 1.8
-    margin_factor = 1.8  # 1 + 0.4*2
+    margin_factor = 1.8
     panels_js = json.dumps([
         {"src": url, "label": lbl, "initScale": round(zb * margin_factor, 2)}
         for url, lbl, zb in zip(source_data_urls, labels, zoom_boosts)
@@ -522,141 +516,290 @@ def build_editor_html(
     sns_handle_escaped = sns_handle.replace("'", "\\'").replace('"', '\\"')
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;-webkit-user-select:none;user-select:none}}
-.wrap{{padding:8px}}
-.editor{{display:flex;gap:3px;justify-content:center;margin:8px 0}}
-.panel-col{{display:flex;flex-direction:column;align-items:center}}
-.vp{{width:{vp_w}px;height:{vp_h}px;overflow:hidden;position:relative;cursor:grab;border:1px solid #444;border-radius:3px}}
+body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;
+  -webkit-user-select:none;user-select:none;touch-action:none;overflow-x:hidden}}
+.wrap{{padding:8px;max-width:100vw}}
+.hint{{text-align:center;color:#888;font-size:12px;margin:4px 0;line-height:1.4}}
+
+/* === Desktop: 横並び === */
+.editor{{display:flex;gap:3px;justify-content:center;margin:8px 0;flex-wrap:nowrap}}
+.panel-col{{display:flex;flex-direction:column;align-items:center;flex:1;min-width:0}}
+.vp{{width:100%;aspect-ratio:384/1080;overflow:hidden;position:relative;cursor:grab;
+  border:1px solid #444;border-radius:3px;touch-action:none}}
 .vp:active{{cursor:grabbing}}
-.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none;transform-origin:center center}}
-.lbl{{font-size:10px;color:#999;margin-top:2px;text-align:center}}
-.rot-btns{{display:flex;gap:2px;margin-top:2px}}
-.rot-btn{{background:#333;color:#ccc;border:1px solid #555;border-radius:3px;padding:1px 5px;font-size:10px;cursor:pointer}}
-.rot-btn:hover{{background:#555}}
+.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none;transform-origin:center center;
+  will-change:transform,width,height,left,top}}
+.lbl{{font-size:10px;color:#999;margin-top:2px;text-align:center;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:100%}}
+.rot-btns{{display:flex;gap:2px;margin-top:2px;flex-wrap:wrap;justify-content:center}}
+.rot-btn{{background:#333;color:#ccc;border:1px solid #555;border-radius:3px;
+  padding:1px 5px;font-size:10px;cursor:pointer;min-height:24px;min-width:32px;
+  display:flex;align-items:center;justify-content:center}}
+.rot-btn:hover,.rot-btn:active{{background:#555}}
 .btns{{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}}
-.btn{{padding:10px 24px;font-size:15px;font-weight:bold;border:none;border-radius:6px;cursor:pointer;color:#fff}}
-.btn-dl{{background:#ff4b4b}}.btn-dl:hover{{background:#e03e3e}}
-.btn-reset{{background:#555}}.btn-reset:hover{{background:#666}}
-.hint{{text-align:center;color:#888;font-size:12px;margin:4px 0}}
+.btn{{padding:10px 24px;font-size:15px;font-weight:bold;border:none;border-radius:6px;
+  cursor:pointer;color:#fff;min-height:44px}}
+.btn-dl{{background:#ff4b4b}}.btn-dl:hover,.btn-dl:active{{background:#e03e3e}}
+.btn-reset{{background:#555}}.btn-reset:hover,.btn-reset:active{{background:#666}}
+
+/* === Tablet (portrait): 横スクロール === */
+@media (max-width:900px){{
+  .editor{{overflow-x:auto;-webkit-overflow-scrolling:touch;justify-content:flex-start;
+    scroll-snap-type:x proximity;padding-bottom:4px}}
+  .panel-col{{min-width:40vw;max-width:40vw;flex:none;scroll-snap-align:start}}
+  .hint{{font-size:11px}}
+  .rot-btn{{min-height:28px;min-width:36px;font-size:11px;padding:2px 6px}}
+}}
+
+/* === Phone: 縦1列 === */
+@media (max-width:480px){{
+  .editor{{flex-direction:column;align-items:center;gap:12px;overflow-x:visible}}
+  .panel-col{{min-width:unset;max-width:unset;width:85vw}}
+  .lbl{{font-size:12px}}
+  .rot-btns{{gap:4px;margin-top:4px}}
+  .rot-btn{{min-height:34px;min-width:44px;font-size:13px;padding:4px 8px}}
+  .btn{{padding:12px 20px;font-size:14px;flex:1;min-width:0}}
+  .btns{{gap:6px;padding:0 8px}}
+  .hint{{font-size:11px}}
+}}
 </style></head><body><div class="wrap">
-<div class="hint">ドラッグ=移動 ／ ホイール=ズーム ／ 下のボタン=回転</div>
+<div class="hint" id="hint-text"></div>
 <div class="editor" id="ed"></div>
 <div class="btns">
-<button class="btn btn-dl" onclick="dl('png')">📥 PNG ダウンロード</button>
-<button class="btn btn-dl" onclick="dl('webp')">📥 WebP ダウンロード</button>
-<button class="btn btn-reset" onclick="resetAll()">🔄 リセット</button>
+<button class="btn btn-dl" onclick="dl('png')">PNG</button>
+<button class="btn btn-dl" onclick="dl('webp')">WebP</button>
+<button class="btn btn-reset" onclick="resetAll()">Reset</button>
 </div></div>
 <canvas id="cv" style="display:none"></canvas>
 <script>
 const P={panels_js};
-const VW={vp_w},VH={vp_h},OW={output_w},OH={output_h},PW={panel_w},SW={src_w},SH={src_h};
+const OW={output_w},OH={output_h},PW={panel_w},SW={src_w},SH={src_h};
 const S=[];
+let activePanel=-1;
+
+/* Detect touch device */
+const isTouchDevice='ontouchstart' in window||navigator.maxTouchPoints>0;
+document.getElementById('hint-text').textContent=isTouchDevice
+  ?'1本指=移動 ／ 2本指=ズーム ／ 下のボタン=回転'
+  :'ドラッグ=移動 ／ ホイール=ズーム ／ 下のボタン=回転';
+
+function getVpSize(vp){{
+  return{{w:vp.clientWidth,h:vp.clientHeight}};
+}}
+
 function applyTransform(s){{
-const w=s.bw*s.sc,h=s.bh*s.sc;
-s.img.style.width=w+'px';s.img.style.height=h+'px';
-s.img.style.left=s.ox+'px';s.img.style.top=s.oy+'px';
-s.img.style.transform='rotate('+s.rot+'deg)';
+  const vs=getVpSize(s.vp);
+  const w=vs.w*s.isc*s.sc,h=vs.h*s.isc*s.sc;
+  s.img.style.width=w+'px';s.img.style.height=h+'px';
+  s.img.style.left=(s.ox*vs.w)+'px';s.img.style.top=(s.oy*vs.h)+'px';
+  s.img.style.transform='rotate('+s.rot+'deg)';
 }}
+
+function initState(i,vp,img,isc){{
+  /* Store positions as ratios of viewport size for responsiveness */
+  const ox=-(isc-1)/2;
+  const oy=-(isc-1)/2;
+  return{{img,vp,ox,oy,sc:1,rot:0,isc,initOx:ox,initOy:oy,initSc:1}};
+}}
+
 function init(){{
-const ed=document.getElementById('ed');
-P.forEach((p,i)=>{{
-const col=document.createElement('div');col.className='panel-col';
-const vp=document.createElement('div');vp.className='vp';
-const img=new Image();img.src=p.src;img.draggable=false;
-const isc=p.initScale||2;
-const bw=VW*isc,bh=VH*isc;
-img.style.width=bw+'px';img.style.height=bh+'px';
-img.style.left=-(bw-VW)/2+'px';img.style.top=-(bh-VH)/2+'px';
-vp.appendChild(img);
-const lbl=document.createElement('div');lbl.className='lbl';lbl.textContent=p.label;
-col.appendChild(vp);col.appendChild(lbl);
-const rotDiv=document.createElement('div');rotDiv.className='rot-btns';
-[[-5,'−5°'],[-1,'−1°'],[1,'+1°'],[5,'+5°']].forEach(([deg,txt])=>{{
-const b=document.createElement('button');b.className='rot-btn';b.textContent=txt;
-b.onclick=()=>{{S[i].rot+=deg;applyTransform(S[i])}};rotDiv.appendChild(b);
-}});
-col.appendChild(rotDiv);ed.appendChild(col);
-const st={{img,ox:-(bw-VW)/2,oy:-(bh-VH)/2,sc:1,rot:0,bw,bh,initOx:-(bw-VW)/2,initOy:-(bh-VH)/2}};
-S.push(st);
-let drag=false,sx,sy,sox,soy;
-vp.addEventListener('mousedown',e=>{{drag=true;sx=e.clientX;sy=e.clientY;sox=st.ox;soy=st.oy;e.preventDefault()}});
-vp.addEventListener('touchstart',e=>{{if(e.touches.length===1){{drag=true;sx=e.touches[0].clientX;sy=e.touches[0].clientY;sox=st.ox;soy=st.oy;e.preventDefault()}}}},{{passive:false}});
-const onMove=(cx,cy)=>{{if(!drag)return;st.ox=sox+(cx-sx);st.oy=soy+(cy-sy);applyTransform(st)}};
-document.addEventListener('mousemove',e=>onMove(e.clientX,e.clientY));
-document.addEventListener('touchmove',e=>{{if(drag&&e.touches.length===1){{onMove(e.touches[0].clientX,e.touches[0].clientY);e.preventDefault()}}}},{{passive:false}});
-document.addEventListener('mouseup',()=>{{drag=false}});
-document.addEventListener('touchend',()=>{{drag=false}});
-vp.addEventListener('wheel',e=>{{
-e.preventDefault();
-const zf=e.deltaY>0?0.93:1.07;
-const ns=Math.max(0.4,Math.min(3,st.sc*zf));
-const vcx=VW/2,vcy=VH/2;
-const icx=(vcx-st.ox)/(st.bw*st.sc)*(st.bw*ns);
-const icy=(vcy-st.oy)/(st.bh*st.sc)*(st.bh*ns);
-st.sc=ns;st.ox=vcx-icx;st.oy=vcy-icy;
-applyTransform(st);
-}},{{passive:false}});
-}});
+  const ed=document.getElementById('ed');
+  P.forEach((p,i)=>{{
+    const col=document.createElement('div');col.className='panel-col';
+    const vp=document.createElement('div');vp.className='vp';
+    const img=new window.Image();img.src=p.src;img.draggable=false;
+    vp.appendChild(img);
+
+    const lbl=document.createElement('div');lbl.className='lbl';lbl.textContent=p.label;
+    col.appendChild(vp);col.appendChild(lbl);
+
+    const rotDiv=document.createElement('div');rotDiv.className='rot-btns';
+    [[-5,'-5°'],[-1,'-1°'],[1,'+1°'],[5,'+5°']].forEach(([deg,txt])=>{{
+      const b=document.createElement('button');b.className='rot-btn';b.textContent=txt;
+      b.addEventListener('click',e=>{{e.preventDefault();S[i].rot+=deg;applyTransform(S[i])}});
+      rotDiv.appendChild(b);
+    }});
+    col.appendChild(rotDiv);ed.appendChild(col);
+
+    const isc=p.initScale||2;
+    const st=initState(i,vp,img,isc);
+    S.push(st);
+
+    /* Apply initial transform after image loads or immediately */
+    const doInit=()=>applyTransform(st);
+    img.addEventListener('load',doInit);
+    requestAnimationFrame(doInit);
+
+    /* --- Mouse events (desktop) --- */
+    let drag=false,sx,sy,sox,soy;
+    vp.addEventListener('mousedown',e=>{{
+      drag=true;activePanel=i;
+      const vs=getVpSize(vp);
+      sx=e.clientX;sy=e.clientY;sox=st.ox;soy=st.oy;
+      e.preventDefault();
+    }});
+    const onMouseMove=e=>{{
+      if(!drag)return;
+      const vs=getVpSize(vp);
+      st.ox=sox+(e.clientX-sx)/vs.w;
+      st.oy=soy+(e.clientY-sy)/vs.h;
+      applyTransform(st);
+    }};
+    const onMouseUp=()=>{{if(drag){{drag=false;activePanel=-1}}}};
+    document.addEventListener('mousemove',onMouseMove);
+    document.addEventListener('mouseup',onMouseUp);
+
+    /* Mouse wheel zoom */
+    vp.addEventListener('wheel',e=>{{
+      e.preventDefault();
+      const vs=getVpSize(vp);
+      const zf=e.deltaY>0?0.93:1.07;
+      const ns=Math.max(0.4,Math.min(3,st.sc*zf));
+      /* Zoom toward viewport center */
+      const vcx=0.5,vcy=0.5;
+      const oldW=st.isc*st.sc,newW=st.isc*ns;
+      st.ox=vcx-(vcx-st.ox)*(newW/oldW);
+      st.oy=vcy-(vcy-st.oy)*(newW/oldW);
+      st.sc=ns;
+      applyTransform(st);
+    }},{{passive:false}});
+
+    /* --- Touch events (mobile/tablet) --- */
+    let tState=null; /* {{id,sx,sy,sox,soy}} or pinch state */
+    vp.addEventListener('touchstart',e=>{{
+      e.preventDefault();
+      activePanel=i;
+      if(e.touches.length===1){{
+        const t=e.touches[0];
+        const vs=getVpSize(vp);
+        tState={{mode:'drag',id:t.identifier,sx:t.clientX,sy:t.clientY,sox:st.ox,soy:st.oy}};
+      }}else if(e.touches.length===2){{
+        const t0=e.touches[0],t1=e.touches[1];
+        const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+        tState={{mode:'pinch',dist0:dist,sc0:st.sc,
+          cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
+          ox0:st.ox,oy0:st.oy}};
+      }}
+    }},{{passive:false}});
+
+    vp.addEventListener('touchmove',e=>{{
+      e.preventDefault();
+      if(!tState)return;
+      const vs=getVpSize(vp);
+      if(tState.mode==='drag'&&e.touches.length===1){{
+        const t=e.touches[0];
+        st.ox=tState.sox+(t.clientX-tState.sx)/vs.w;
+        st.oy=tState.soy+(t.clientY-tState.sy)/vs.h;
+        applyTransform(st);
+      }}else if(e.touches.length===2){{
+        const t0=e.touches[0],t1=e.touches[1];
+        const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+        if(tState.mode==='drag'){{
+          /* Switch to pinch */
+          tState={{mode:'pinch',dist0:dist,sc0:st.sc,
+            cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
+            ox0:st.ox,oy0:st.oy}};
+          return;
+        }}
+        const ratio=dist/tState.dist0;
+        const ns=Math.max(0.4,Math.min(3,tState.sc0*ratio));
+        /* Zoom toward pinch center */
+        const rect=vp.getBoundingClientRect();
+        const pcx=((tState.cx0-rect.left)/vs.w);
+        const pcy=((tState.cy0-rect.top)/vs.h);
+        const oldW=st.isc*tState.sc0,newW=st.isc*ns;
+        st.ox=pcx-(pcx-tState.ox0)*(newW/oldW);
+        st.oy=pcy-(pcy-tState.oy0)*(newW/oldW);
+        /* Also pan with pinch center movement */
+        const cx=(t0.clientX+t1.clientX)/2;
+        const cy=(t0.clientY+t1.clientY)/2;
+        st.ox+=(cx-tState.cx0)/vs.w;
+        st.oy+=(cy-tState.cy0)/vs.h;
+        st.sc=ns;
+        applyTransform(st);
+      }}
+    }},{{passive:false}});
+
+    vp.addEventListener('touchend',e=>{{
+      if(e.touches.length===0){{tState=null;activePanel=-1}}
+      else if(e.touches.length===1){{
+        const t=e.touches[0];
+        const vs=getVpSize(vp);
+        tState={{mode:'drag',id:t.identifier,sx:t.clientX,sy:t.clientY,sox:st.ox,soy:st.oy}};
+      }}
+    }});
+    vp.addEventListener('touchcancel',()=>{{tState=null;activePanel=-1}});
+  }});
+
+  /* Reapply transforms on resize (responsive) */
+  let resizeTimer;
+  window.addEventListener('resize',()=>{{
+    clearTimeout(resizeTimer);
+    resizeTimer=setTimeout(()=>S.forEach(s=>applyTransform(s)),100);
+  }});
 }}
+
 function render(){{
-const c=document.getElementById('cv');c.width=OW;c.height=OH;
-const ctx=c.getContext('2d');
-ctx.fillStyle='#0f0f0f';ctx.fillRect(0,0,OW,OH);
-S.forEach((s,i)=>{{
-const cw=s.bw*s.sc,ch=s.bh*s.sc;
-const rx=SW/cw,ry=SH/ch;
-const sx_=(-s.ox)*rx,sy_=(-s.oy)*ry,sw_=VW*rx,sh_=VH*ry;
-/* panel x: use exact integer coords, last panel absorbs remainder */
-const px=(i===S.length-1)?OW-PW:i*PW;
-const pw=(i===S.length-1)?PW:PW+1; /* +1 overlap to kill sub-pixel gaps */
-ctx.save();
-ctx.beginPath();ctx.rect(px,0,pw,OH);ctx.clip();
-const pcx=px+PW/2,pcy=OH/2;
-if(Math.abs(s.rot)>0.01){{
-/* rotation: expand draw rect to cover corners */
-const rad=Math.abs(s.rot)*Math.PI/180;
-const exW=Math.ceil(PW*Math.abs(Math.cos(rad))+OH*Math.abs(Math.sin(rad)));
-const exH=Math.ceil(PW*Math.abs(Math.sin(rad))+OH*Math.abs(Math.cos(rad)));
-const exSx=sw_*(exW-PW)/(2*PW),exSy=sh_*(exH-OH)/(2*OH);
-ctx.translate(pcx,pcy);
-ctx.rotate(s.rot*Math.PI/180);
-ctx.drawImage(s.img,sx_-exSx,sy_-exSy,sw_+2*exSx,sh_+2*exSy,-exW/2,-exH/2,exW,exH);
-}}else{{
-ctx.drawImage(s.img,sx_,sy_,sw_,sh_,px,0,pw,OH);
-}}
-ctx.restore();
-}});
-const fm='{footer_mode}';
-if(fm==='clinic'&&'{footer_text_escaped}'){{
-const fh=Math.round(OH*0.08),fy=OH-fh;
-ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,fy,OW,fh);
-ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=1;
-ctx.beginPath();ctx.moveTo(0,fy);ctx.lineTo(OW,fy);ctx.stroke();
-const fs=Math.round(fh*0.6);
-ctx.font=fs+'px "Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans CJK JP","Meiryo",sans-serif';
-ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
-ctx.fillText('{footer_text_escaped}',OW/2,fy+fh/2);
-}}else if(fm==='sns'){{
-const fs=Math.round(OH*0.03);
-ctx.font=fs+'px "Hiragino Kaku Gothic ProN",sans-serif';
-ctx.fillStyle='rgba(255,255,255,0.85)';ctx.textAlign='right';ctx.textBaseline='bottom';
-ctx.fillText('{sns_handle_escaped}',OW-20,OH-20);
-}}
-return c;
+  const c=document.getElementById('cv');c.width=OW;c.height=OH;
+  const ctx=c.getContext('2d');
+  ctx.fillStyle='#0f0f0f';ctx.fillRect(0,0,OW,OH);
+  S.forEach((s,i)=>{{
+    const vs=getVpSize(s.vp);
+    const imgW=vs.w*s.isc*s.sc, imgH=vs.h*s.isc*s.sc;
+    const rx=SW/imgW, ry=SH/imgH;
+    const sx_=(-s.ox*vs.w)*rx, sy_=(-s.oy*vs.h)*ry;
+    const sw_=vs.w*rx, sh_=vs.h*ry;
+    const px=(i===S.length-1)?OW-PW:i*PW;
+    const pw=(i===S.length-1)?PW:PW+1;
+    ctx.save();
+    ctx.beginPath();ctx.rect(px,0,pw,OH);ctx.clip();
+    const pcx=px+PW/2,pcy=OH/2;
+    if(Math.abs(s.rot)>0.01){{
+      const rad=Math.abs(s.rot)*Math.PI/180;
+      const exW=Math.ceil(PW*Math.abs(Math.cos(rad))+OH*Math.abs(Math.sin(rad)));
+      const exH=Math.ceil(PW*Math.abs(Math.sin(rad))+OH*Math.abs(Math.cos(rad)));
+      const exSx=sw_*(exW-PW)/(2*PW),exSy=sh_*(exH-OH)/(2*OH);
+      ctx.translate(pcx,pcy);
+      ctx.rotate(s.rot*Math.PI/180);
+      ctx.drawImage(s.img,sx_-exSx,sy_-exSy,sw_+2*exSx,sh_+2*exSy,-exW/2,-exH/2,exW,exH);
+    }}else{{
+      ctx.drawImage(s.img,sx_,sy_,sw_,sh_,px,0,pw,OH);
+    }}
+    ctx.restore();
+  }});
+  const fm='{footer_mode}';
+  if(fm==='clinic'&&'{footer_text_escaped}'){{
+    const fh=Math.round(OH*0.08),fy=OH-fh;
+    ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,fy,OW,fh);
+    ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(0,fy);ctx.lineTo(OW,fy);ctx.stroke();
+    const fs=Math.round(fh*0.6);
+    ctx.font=fs+'px "Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans CJK JP","Meiryo",sans-serif';
+    ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('{footer_text_escaped}',OW/2,fy+fh/2);
+  }}else if(fm==='sns'){{
+    const fs=Math.round(OH*0.03);
+    ctx.font=fs+'px "Hiragino Kaku Gothic ProN",sans-serif';
+    ctx.fillStyle='rgba(255,255,255,0.85)';ctx.textAlign='right';ctx.textBaseline='bottom';
+    ctx.fillText('{sns_handle_escaped}',OW-20,OH-20);
+  }}
+  return c;
 }}
 function dl(fmt){{
-const c=render();const a=document.createElement('a');
-if(fmt==='webp'){{a.download='case_composite.webp';a.href=c.toDataURL('image/webp',0.92)}}
-else{{a.download='case_composite.png';a.href=c.toDataURL('image/png')}}
-a.click();
+  const c=render();const a=document.createElement('a');
+  if(fmt==='webp'){{a.download='case_composite.webp';a.href=c.toDataURL('image/webp',0.92)}}
+  else{{a.download='case_composite.png';a.href=c.toDataURL('image/png')}}
+  a.click();
 }}
 function resetAll(){{
-S.forEach(s=>{{
-s.sc=1;s.rot=0;s.ox=s.initOx;s.oy=s.initOy;
-applyTransform(s);
-}});
+  S.forEach(s=>{{
+    s.sc=1;s.rot=0;s.ox=s.initOx;s.oy=s.initOy;
+    applyTransform(s);
+  }});
 }}
 init();
 </script></body></html>"""
@@ -714,7 +857,7 @@ def main():
         )
 
         st.divider()
-        st.caption("v3.2 — CV自動 + 手動微調整")
+        st.caption("v3.5 — レスポンシブ対応")
 
     # ---- 写真アップロード ----
     st.subheader("📷 写真をアップロード（5枚まとめてドラッグ＆ドロップ可）")
@@ -859,7 +1002,7 @@ def main():
             footer_mode=mode,
             sns_handle=sns_handle,
         )
-        components.html(html, height=580, scrolling=False)
+        components.html(html, height=700, scrolling=True)
 
         # ---- CVデバッグ ----
         if "cv_debug_images" in st.session_state:
