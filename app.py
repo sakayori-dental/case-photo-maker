@@ -1,6 +1,6 @@
 """
-歯科症例写真 自動合成アプリ v3.5
-OpenCV自動処理 → 手動微調整 → 5パネル合成
+歯科症例写真 自動合成アプリ v3.6
+OpenCV自動処理 → 手動微調整 → 3〜5パネル合成
 """
 from __future__ import annotations
 
@@ -21,14 +21,17 @@ APP_DIR = Path(__file__).parent
 REFERENCE_DIR = APP_DIR / "reference"
 
 OUTPUT_PRESETS = {
+    "A4横向き (3508×2480)": (3508, 2480),
+    "A4縦向き (2480×3508)": (2480, 3508),
     "1920×1080 (フルHD)": (1920, 1080),
     "1600×900": (1600, 900),
     "1280×720 (HD)": (1280, 720),
 }
-NUM_PANELS = 5
+MIN_PANELS = 3
+MAX_PANELS = 5
 BG_COLOR = "#0f0f0f"
 
-PHOTO_LABELS = [
+PHOTO_LABELS_DEFAULT = [
     "① 術前・頬側観",
     "② 術前・咬合面観",
     "③ 術中・窩洞形成後",
@@ -350,13 +353,14 @@ def compose_panels(
     sns_handle: str = "@dentist_mickey",
     logo_img: Image.Image | None = None,
 ) -> Image.Image:
-    """5パネル合成 + フッター/オーバーレイ描画"""
+    """Nパネル合成 + フッター/オーバーレイ描画"""
     out_w, out_h = output_size
+    num_panels = len(panels)
     canvas = Image.new("RGB", (out_w, out_h), BG_COLOR)
 
     # パネル幅を均等に配分（余りは左側のパネルに1pxずつ加算）
-    base_w = out_w // NUM_PANELS
-    remainder = out_w % NUM_PANELS
+    base_w = out_w // num_panels
+    remainder = out_w % num_panels
     x_offset = 0
     for i, panel in enumerate(panels):
         pw = base_w + (1 if i < remainder else 0)
@@ -438,7 +442,7 @@ def _draw_sns_overlay(
 # ============================================================
 # ドラッグ編集エディタ
 # ============================================================
-def _img_to_data_url(img: Image.Image, quality: int = 80) -> str:
+def _img_to_data_url(img: Image.Image, quality: int = 95) -> str:
     """PIL Image → base64 data URL"""
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
@@ -491,25 +495,38 @@ def generate_editor_source(
     return ImageOps.fit(cropped, (target_w, target_h), method=Image.BICUBIC)
 
 
+def generate_editor_source_simple(
+    img_pil: Image.Image,
+    rotation_deg: float,
+    max_dim: int = 3000,
+) -> Image.Image:
+    """CV処理なしでソース画像を生成。アスペクト比を維持してリサイズ。"""
+    img = fix_orientation(img_pil)
+    if abs(rotation_deg) > 0.1:
+        img = img.rotate(-rotation_deg, expand=True, resample=Image.BICUBIC)
+    # アスペクト比を維持してリサイズ
+    img.thumbnail((max_dim, max_dim), Image.BICUBIC)
+    return img
+
+
 def build_editor_html(
     source_data_urls: list[str],
     labels: list[str],
     zoom_boosts: list[float],
-    output_w: int = 1920,
-    output_h: int = 1080,
-    footer_text: str = "",
+    source_sizes: list[tuple[int, int]],
+    output_w: int = 3508,
+    output_h: int = 2480,
+    footer_text: str = "坂寄歯科医院",
     footer_mode: str = "clinic",
-    sns_handle: str = "",
+    sns_handle: str = "@dentist_mickey",
 ) -> str:
-    """ドラッグ＆ズーム可能な5パネルエディタのHTML/JSを生成（レスポンシブ対応）"""
+    """単一キャンバスWYSIWYGエディタのHTML/JSを生成"""
     num = len(source_data_urls)
     panel_w = output_w // num
-    src_w, src_h = 768, 2160
 
-    margin_factor = 1.8
     panels_js = json.dumps([
-        {"src": url, "label": lbl, "initScale": round(zb * margin_factor, 2)}
-        for url, lbl, zb in zip(source_data_urls, labels, zoom_boosts)
+        {"src": url, "label": lbl, "sw": sw, "sh": sh}
+        for url, lbl, (sw, sh) in zip(source_data_urls, labels, source_sizes)
     ])
 
     footer_text_escaped = footer_text.replace("'", "\\'").replace('"', '\\"')
@@ -521,287 +538,371 @@ def build_editor_html(
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#1a1a1a;color:#fff;font-family:-apple-system,sans-serif;
-  -webkit-user-select:none;user-select:none;touch-action:none;overflow-x:hidden}}
-.wrap{{padding:8px;max-width:100vw}}
-.hint{{text-align:center;color:#888;font-size:12px;margin:4px 0;line-height:1.4}}
-
-/* === Desktop: 横並び === */
-.editor{{display:flex;gap:3px;justify-content:center;margin:8px 0;flex-wrap:nowrap}}
-.panel-col{{display:flex;flex-direction:column;align-items:center;flex:1;min-width:0}}
-.vp{{width:100%;aspect-ratio:384/1080;overflow:hidden;position:relative;cursor:grab;
-  border:1px solid #444;border-radius:3px;touch-action:none}}
-.vp:active{{cursor:grabbing}}
-.vp img{{position:absolute;pointer-events:none;-webkit-user-drag:none;transform-origin:center center;
-  will-change:transform,width,height,left,top}}
-.lbl{{font-size:10px;color:#999;margin-top:2px;text-align:center;white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;max-width:100%}}
-.rot-btns{{display:flex;gap:2px;margin-top:2px;flex-wrap:wrap;justify-content:center}}
-.rot-btn{{background:#333;color:#ccc;border:1px solid #555;border-radius:3px;
-  padding:1px 5px;font-size:10px;cursor:pointer;min-height:24px;min-width:32px;
+  -webkit-user-select:none;user-select:none;overflow-x:hidden}}
+.wrap{{padding:4px;max-width:100vw}}
+#preview{{width:100%;aspect-ratio:{output_w}/{output_h};background:#0f0f0f;
+  cursor:grab;touch-action:none;border:2px solid #444;border-radius:4px;
+  image-rendering:auto}}
+#preview:active{{cursor:grabbing}}
+.sel-info{{text-align:center;color:#aaa;font-size:12px;margin:4px 0}}
+.sel-info .sel-name{{color:#ff4b4b;font-weight:bold}}
+.ctrl-row{{display:flex;gap:2px;justify-content:center;flex-wrap:wrap;margin:3px 0}}
+.ctrl-btn{{background:#333;color:#ccc;border:1px solid #555;border-radius:3px;
+  padding:2px 6px;font-size:10px;cursor:pointer;min-height:22px;
   display:flex;align-items:center;justify-content:center}}
-.rot-btn:hover,.rot-btn:active{{background:#555}}
-.btns{{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}}
-.btn{{padding:10px 24px;font-size:15px;font-weight:bold;border:none;border-radius:6px;
-  cursor:pointer;color:#fff;min-height:44px}}
-.btn-dl{{background:#ff4b4b}}.btn-dl:hover,.btn-dl:active{{background:#e03e3e}}
-.btn-reset{{background:#555}}.btn-reset:hover,.btn-reset:active{{background:#666}}
-
-/* === Tablet (portrait): 横スクロール === */
-@media (max-width:900px){{
-  .editor{{overflow-x:auto;-webkit-overflow-scrolling:touch;justify-content:flex-start;
-    scroll-snap-type:x proximity;padding-bottom:4px}}
-  .panel-col{{min-width:40vw;max-width:40vw;flex:none;scroll-snap-align:start}}
-  .hint{{font-size:11px}}
-  .rot-btn{{min-height:28px;min-width:36px;font-size:11px;padding:2px 6px}}
-}}
-
-/* === Phone: 縦1列 === */
-@media (max-width:480px){{
-  .editor{{flex-direction:column;align-items:center;gap:12px;overflow-x:visible}}
-  .panel-col{{min-width:unset;max-width:unset;width:85vw}}
-  .lbl{{font-size:12px}}
-  .rot-btns{{gap:4px;margin-top:4px}}
-  .rot-btn{{min-height:34px;min-width:44px;font-size:13px;padding:4px 8px}}
-  .btn{{padding:12px 20px;font-size:14px;flex:1;min-width:0}}
-  .btns{{gap:6px;padding:0 8px}}
-  .hint{{font-size:11px}}
-}}
+.ctrl-btn:hover,.ctrl-btn:active{{background:#555}}
+.ctrl-btn.active{{background:#ff4b4b;color:#fff;border-color:#ff4b4b}}
+.btns{{display:flex;gap:8px;justify-content:center;margin:6px 0;flex-wrap:wrap}}
+.btn{{padding:8px 20px;font-size:14px;font-weight:bold;border:none;border-radius:6px;
+  cursor:pointer;color:#fff;min-height:36px}}
+.btn-dl{{background:#ff4b4b}}.btn-dl:hover{{background:#e03e3e}}
+.btn-reset{{background:#555}}.btn-reset:hover{{background:#666}}
 </style></head><body><div class="wrap">
-<div class="hint" id="hint-text"></div>
-<div class="editor" id="ed"></div>
+<canvas id="preview"></canvas>
+<div class="sel-info">選択中: <span class="sel-name" id="sel-name">① (クリックで写真を選択)</span>
+  <span id="sel-info-detail">角度:0.0° ズーム:1.0x</span></div>
+<div class="ctrl-row" id="panel-tabs"></div>
+<div class="ctrl-row" id="rot-ctrl"></div>
+<div class="ctrl-row" id="zoom-ctrl"></div>
+<div class="ctrl-row">
+  <select id="footer-mode" class="ctrl-btn" style="min-width:120px" onchange="changeFooterMode()">
+    <option value="plain">シンプル（ロゴなし）</option>
+    <option value="clinic">医院名フッター</option>
+    <option value="sns">SNSオーバーレイ</option>
+  </select>
+  <input id="footer-text" type="text" class="ctrl-btn" style="min-width:120px;background:#222;color:#fff" value="{footer_text_escaped}" placeholder="医院名" oninput="draw()">
+  <input id="sns-text" type="text" class="ctrl-btn" style="min-width:100px;background:#222;color:#fff;display:none" value="{sns_handle_escaped}" placeholder="@handle" oninput="draw()">
+</div>
 <div class="btns">
-<button class="btn btn-dl" onclick="dl('png')">PNG</button>
-<button class="btn btn-dl" onclick="dl('webp')">WebP</button>
-<button class="btn btn-reset" onclick="resetAll()">Reset</button>
+<button class="btn btn-dl" onclick="dlFull('png')">PNG ダウンロード</button>
+<button class="btn btn-dl" onclick="dlFull('webp')">WebP ダウンロード</button>
+<button class="btn btn-reset" onclick="resetAll()">リセット</button>
 </div></div>
 <canvas id="cv" style="display:none"></canvas>
 <script>
 const P={panels_js};
-const OW={output_w},OH={output_h},PW={panel_w},SW={src_w},SH={src_h};
-const S=[];
-let activePanel=-1;
+const OW={output_w},OH={output_h},PW={panel_w},N=P.length;
+/* State per panel: ox,oy in output coords (px), sc=zoom, rot=degrees */
+const S=P.map((p,i)=>{{
+  return{{ox:PW*i+PW/2, oy:OH/2, sc:1.0, rot:0, imgEl:null,
+    initOx:PW*i+PW/2, initOy:OH/2}};
+}});
+let sel=0; /* selected panel index */
+let showGrid=true;
 
-/* Detect touch device */
-const isTouchDevice='ontouchstart' in window||navigator.maxTouchPoints>0;
-document.getElementById('hint-text').textContent=isTouchDevice
-  ?'1本指=移動 ／ 2本指=ズーム ／ 下のボタン=回転'
-  :'ドラッグ=移動 ／ ホイール=ズーム ／ 下のボタン=回転';
-
-function getVpSize(vp){{
-  return{{w:vp.clientWidth,h:vp.clientHeight}};
+function getFooterMode(){{return document.getElementById('footer-mode').value}}
+function getFooterText(){{return document.getElementById('footer-text').value}}
+function getSnsText(){{return document.getElementById('sns-text').value}}
+function changeFooterMode(){{
+  const m=getFooterMode();
+  document.getElementById('footer-text').style.display=m==='clinic'?'':'none';
+  document.getElementById('sns-text').style.display=m==='sns'?'':'none';
+  draw();
 }}
 
-function applyTransform(s){{
-  const vs=getVpSize(s.vp);
-  const w=vs.w*s.isc*s.sc,h=vs.h*s.isc*s.sc;
-  s.img.style.width=w+'px';s.img.style.height=h+'px';
-  s.img.style.left=(s.ox*vs.w)+'px';s.img.style.top=(s.oy*vs.h)+'px';
-  s.img.style.transform='rotate('+s.rot+'deg)';
+function drawFooter(ctx,w,h){{
+  const fm=getFooterMode();
+  const ft=getFooterText();
+  const sn=getSnsText();
+  if(fm==='clinic'&&ft){{
+    const fh=Math.round(h*0.06),fy=h-fh;
+    ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,fy,w,fh);
+    ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(0,fy);ctx.lineTo(w,fy);ctx.stroke();
+    const fs=Math.round(fh*0.55);
+    ctx.font='bold '+fs+'px "Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans CJK JP","Meiryo",sans-serif';
+    ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(ft,w/2,fy+fh/2);
+  }}else if(fm==='sns'&&sn){{
+    const fs=Math.round(h*0.025);
+    ctx.font=fs+'px "Hiragino Kaku Gothic ProN",sans-serif';
+    ctx.fillStyle='rgba(255,255,255,0.85)';ctx.textAlign='right';ctx.textBaseline='bottom';
+    ctx.fillText(sn,w-30,h-30);
+  }}
 }}
 
-function initState(i,vp,img,isc){{
-  /* Store positions as ratios of viewport size for responsiveness */
-  const ox=-(isc-1)/2;
-  const oy=-(isc-1)/2;
-  return{{img,vp,ox,oy,sc:1,rot:0,isc,initOx:ox,initOy:oy,initSc:1}};
+/* Load images */
+const imgs=[];
+let loadCount=0;
+P.forEach((p,i)=>{{
+  const im=new Image();
+  im.onload=()=>{{loadCount++;if(loadCount===N)draw()}};
+  im.src=p.src;
+  imgs.push(im);
+  S[i].imgEl=im;
+}});
+
+const cv=document.getElementById('preview');
+function getCvScale(){{return cv.clientWidth/OW}}
+
+function draw(){{
+  const dpr=1;/* use 1 for performance, actual output uses full res */
+  cv.width=cv.clientWidth;cv.height=cv.clientHeight;
+  const sc=cv.width/OW;
+  const ctx=cv.getContext('2d');
+  ctx.fillStyle='#0f0f0f';ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.save();ctx.scale(sc,sc);
+
+  S.forEach((s,i)=>{{
+    const im=imgs[i];if(!im.complete)return;
+    const pw=PW,ph=OH;
+    const px=i*PW;
+
+    ctx.save();
+    ctx.beginPath();ctx.rect(px,0,pw,ph);ctx.clip();
+
+    /* Center of this panel slot */
+    const cx=px+pw/2, cy=ph/2;
+
+    /* Image dimensions scaled to fill panel slot while maintaining aspect ratio */
+    const imgR=im.naturalWidth/im.naturalHeight;
+    const slotR=pw/ph;
+    let drawW,drawH;
+    if(imgR>slotR){{drawH=ph*s.sc;drawW=drawH*imgR}}
+    else{{drawW=pw*s.sc;drawH=drawW/imgR}}
+
+    ctx.translate(s.ox, s.oy);
+    if(Math.abs(s.rot)>0.01)ctx.rotate(s.rot*Math.PI/180);
+    ctx.drawImage(im, -drawW/2, -drawH/2, drawW, drawH);
+    ctx.restore();
+  }});
+
+  /* Footer / overlay (dynamic) */
+  drawFooter(ctx,OW,OH);
+
+  /* Grid overlay (thirds + center) */
+  if(showGrid){{
+    ctx.strokeStyle='rgba(255,255,0,0.5)';ctx.lineWidth=2;
+    for(let i=0;i<N;i++){{
+      const px=i*PW;
+      /* Vertical thirds */
+      ctx.beginPath();ctx.moveTo(px+PW/3,0);ctx.lineTo(px+PW/3,OH);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(px+PW*2/3,0);ctx.lineTo(px+PW*2/3,OH);ctx.stroke();
+      /* Horizontal thirds */
+      ctx.beginPath();ctx.moveTo(px,OH/3);ctx.lineTo(px+PW,OH/3);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(px,OH*2/3);ctx.lineTo(px+PW,OH*2/3);ctx.stroke();
+      /* Center crosshair */
+      ctx.strokeStyle='rgba(0,255,255,0.45)';ctx.lineWidth=2;
+      ctx.setLineDash([12,8]);
+      ctx.beginPath();ctx.moveTo(px+PW/2,0);ctx.lineTo(px+PW/2,OH);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(px,OH/2);ctx.lineTo(px+PW,OH/2);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle='rgba(255,255,0,0.5)';
+    }}
+    /* Panel dividers */
+    ctx.strokeStyle='rgba(255,100,100,0.7)';ctx.lineWidth=3;
+    for(let i=1;i<N;i++){{
+      ctx.beginPath();ctx.moveTo(i*PW,0);ctx.lineTo(i*PW,OH);ctx.stroke();
+    }}
+  }}
+
+  /* Selection highlight */
+  const spx=sel*PW;
+  ctx.strokeStyle='#ff4b4b';ctx.lineWidth=4;
+  ctx.strokeRect(spx+2,2,PW-4,OH-4);
+
+  ctx.restore();
 }}
 
-function init(){{
-  const ed=document.getElementById('ed');
+function updateUI(){{
+  const s=S[sel];
+  document.getElementById('sel-name').textContent=P[sel].label;
+  document.getElementById('sel-info-detail').textContent=
+    '角度:'+s.rot.toFixed(1)+'° ズーム:'+s.sc.toFixed(1)+'x';
+  document.querySelectorAll('.tab-btn').forEach((b,i)=>{{
+    b.classList.toggle('active',i===sel);
+  }});
+  draw();
+}}
+
+/* Panel selection tabs */
+(function(){{
+  const tabs=document.getElementById('panel-tabs');
   P.forEach((p,i)=>{{
-    const col=document.createElement('div');col.className='panel-col';
-    const vp=document.createElement('div');vp.className='vp';
-    const img=new window.Image();img.src=p.src;img.draggable=false;
-    vp.appendChild(img);
-
-    const lbl=document.createElement('div');lbl.className='lbl';lbl.textContent=p.label;
-    col.appendChild(vp);col.appendChild(lbl);
-
-    const rotDiv=document.createElement('div');rotDiv.className='rot-btns';
-    [[-5,'-5°'],[-1,'-1°'],[1,'+1°'],[5,'+5°']].forEach(([deg,txt])=>{{
-      const b=document.createElement('button');b.className='rot-btn';b.textContent=txt;
-      b.addEventListener('click',e=>{{e.preventDefault();S[i].rot+=deg;applyTransform(S[i])}});
-      rotDiv.appendChild(b);
-    }});
-    col.appendChild(rotDiv);ed.appendChild(col);
-
-    const isc=p.initScale||2;
-    const st=initState(i,vp,img,isc);
-    S.push(st);
-
-    /* Apply initial transform after image loads or immediately */
-    const doInit=()=>applyTransform(st);
-    img.addEventListener('load',doInit);
-    requestAnimationFrame(doInit);
-
-    /* --- Mouse events (desktop) --- */
-    let drag=false,sx,sy,sox,soy;
-    vp.addEventListener('mousedown',e=>{{
-      drag=true;activePanel=i;
-      const vs=getVpSize(vp);
-      sx=e.clientX;sy=e.clientY;sox=st.ox;soy=st.oy;
-      e.preventDefault();
-    }});
-    const onMouseMove=e=>{{
-      if(!drag)return;
-      const vs=getVpSize(vp);
-      st.ox=sox+(e.clientX-sx)/vs.w;
-      st.oy=soy+(e.clientY-sy)/vs.h;
-      applyTransform(st);
-    }};
-    const onMouseUp=()=>{{if(drag){{drag=false;activePanel=-1}}}};
-    document.addEventListener('mousemove',onMouseMove);
-    document.addEventListener('mouseup',onMouseUp);
-
-    /* Mouse wheel zoom */
-    vp.addEventListener('wheel',e=>{{
-      e.preventDefault();
-      const vs=getVpSize(vp);
-      const zf=e.deltaY>0?0.93:1.07;
-      const ns=Math.max(0.4,Math.min(3,st.sc*zf));
-      /* Zoom toward viewport center */
-      const vcx=0.5,vcy=0.5;
-      const oldW=st.isc*st.sc,newW=st.isc*ns;
-      st.ox=vcx-(vcx-st.ox)*(newW/oldW);
-      st.oy=vcy-(vcy-st.oy)*(newW/oldW);
-      st.sc=ns;
-      applyTransform(st);
-    }},{{passive:false}});
-
-    /* --- Touch events (mobile/tablet) --- */
-    let tState=null; /* {{id,sx,sy,sox,soy}} or pinch state */
-    vp.addEventListener('touchstart',e=>{{
-      e.preventDefault();
-      activePanel=i;
-      if(e.touches.length===1){{
-        const t=e.touches[0];
-        const vs=getVpSize(vp);
-        tState={{mode:'drag',id:t.identifier,sx:t.clientX,sy:t.clientY,sox:st.ox,soy:st.oy}};
-      }}else if(e.touches.length===2){{
-        const t0=e.touches[0],t1=e.touches[1];
-        const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
-        tState={{mode:'pinch',dist0:dist,sc0:st.sc,
-          cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
-          ox0:st.ox,oy0:st.oy}};
-      }}
-    }},{{passive:false}});
-
-    vp.addEventListener('touchmove',e=>{{
-      e.preventDefault();
-      if(!tState)return;
-      const vs=getVpSize(vp);
-      if(tState.mode==='drag'&&e.touches.length===1){{
-        const t=e.touches[0];
-        st.ox=tState.sox+(t.clientX-tState.sx)/vs.w;
-        st.oy=tState.soy+(t.clientY-tState.sy)/vs.h;
-        applyTransform(st);
-      }}else if(e.touches.length===2){{
-        const t0=e.touches[0],t1=e.touches[1];
-        const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
-        if(tState.mode==='drag'){{
-          /* Switch to pinch */
-          tState={{mode:'pinch',dist0:dist,sc0:st.sc,
-            cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
-            ox0:st.ox,oy0:st.oy}};
-          return;
-        }}
-        const ratio=dist/tState.dist0;
-        const ns=Math.max(0.4,Math.min(3,tState.sc0*ratio));
-        /* Zoom toward pinch center */
-        const rect=vp.getBoundingClientRect();
-        const pcx=((tState.cx0-rect.left)/vs.w);
-        const pcy=((tState.cy0-rect.top)/vs.h);
-        const oldW=st.isc*tState.sc0,newW=st.isc*ns;
-        st.ox=pcx-(pcx-tState.ox0)*(newW/oldW);
-        st.oy=pcy-(pcy-tState.oy0)*(newW/oldW);
-        /* Also pan with pinch center movement */
-        const cx=(t0.clientX+t1.clientX)/2;
-        const cy=(t0.clientY+t1.clientY)/2;
-        st.ox+=(cx-tState.cx0)/vs.w;
-        st.oy+=(cy-tState.cy0)/vs.h;
-        st.sc=ns;
-        applyTransform(st);
-      }}
-    }},{{passive:false}});
-
-    vp.addEventListener('touchend',e=>{{
-      if(e.touches.length===0){{tState=null;activePanel=-1}}
-      else if(e.touches.length===1){{
-        const t=e.touches[0];
-        const vs=getVpSize(vp);
-        tState={{mode:'drag',id:t.identifier,sx:t.clientX,sy:t.clientY,sox:st.ox,soy:st.oy}};
-      }}
-    }});
-    vp.addEventListener('touchcancel',()=>{{tState=null;activePanel=-1}});
+    const b=document.createElement('button');
+    b.className='ctrl-btn tab-btn'+(i===0?' active':'');
+    b.textContent=p.label;
+    b.addEventListener('click',e=>{{e.preventDefault();sel=i;updateUI()}});
+    tabs.appendChild(b);
   }});
+}})();
 
-  /* Reapply transforms on resize (responsive) */
-  let resizeTimer;
-  window.addEventListener('resize',()=>{{
-    clearTimeout(resizeTimer);
-    resizeTimer=setTimeout(()=>S.forEach(s=>applyTransform(s)),100);
+/* Rotation controls */
+(function(){{
+  const row=document.getElementById('rot-ctrl');
+  [[-90,'↺90'],[-5,'-5°'],[-1,'-1°'],[-0.1,'-0.1°'],[0.1,'+0.1°'],[1,'+1°'],[5,'+5°'],[90,'↻90'],[180,'180°']].forEach(([deg,txt])=>{{
+    const b=document.createElement('button');b.className='ctrl-btn';b.textContent=txt;
+    b.addEventListener('click',e=>{{e.preventDefault();S[sel].rot+=deg;updateUI()}});
+    row.appendChild(b);
   }});
+}})();
+
+/* Zoom controls */
+(function(){{
+  const row=document.getElementById('zoom-ctrl');
+  const zminus=document.createElement('button');zminus.className='ctrl-btn';zminus.textContent='🔍−';
+  zminus.addEventListener('click',e=>{{e.preventDefault();S[sel].sc=Math.max(0.2,S[sel].sc-0.05);updateUI()}});
+  const zplus=document.createElement('button');zplus.className='ctrl-btn';zplus.textContent='🔍+';
+  zplus.addEventListener('click',e=>{{e.preventDefault();S[sel].sc=Math.min(5,S[sel].sc+0.05);updateUI()}});
+  const gridBtn=document.createElement('button');gridBtn.className='ctrl-btn active';gridBtn.textContent='# グリッド';gridBtn.id='grid-btn';
+  gridBtn.addEventListener('click',e=>{{e.preventDefault();showGrid=!showGrid;gridBtn.classList.toggle('active',showGrid);draw()}});
+  row.appendChild(zminus);row.appendChild(zplus);row.appendChild(gridBtn);
+}})();
+
+/* --- Mouse interaction on canvas --- */
+function hitTest(x,y){{
+  /* Which panel slot does (x,y) in output coords fall into? */
+  const idx=Math.floor(x/PW);
+  return Math.max(0,Math.min(N-1,idx));
 }}
 
-function render(){{
+let drag=false,dsx,dsy,dsox,dsoy;
+cv.addEventListener('mousedown',e=>{{
+  const rect=cv.getBoundingClientRect();
+  const sc=getCvScale();
+  const ox=(e.clientX-rect.left)/sc, oy=(e.clientY-rect.top)/sc;
+  const hit=hitTest(ox,oy);
+  sel=hit; updateUI();
+  drag=true;dsx=e.clientX;dsy=e.clientY;
+  dsox=S[sel].ox;dsoy=S[sel].oy;
+  e.preventDefault();
+}});
+document.addEventListener('mousemove',e=>{{
+  if(!drag)return;
+  const sc=getCvScale();
+  S[sel].ox=dsox+(e.clientX-dsx)/sc;
+  S[sel].oy=dsoy+(e.clientY-dsy)/sc;
+  draw();updateUI();
+}});
+document.addEventListener('mouseup',()=>{{drag=false}});
+
+cv.addEventListener('wheel',e=>{{
+  e.preventDefault();
+  const zf=e.deltaY>0?0.97:1.03;
+  const s=S[sel];
+  const rect=cv.getBoundingClientRect();
+  const sc=getCvScale();
+  /* Zoom toward mouse position in output coords */
+  const mx=(e.clientX-rect.left)/sc, my=(e.clientY-rect.top)/sc;
+  const ns=Math.max(0.2,Math.min(5,s.sc*zf));
+  const ratio=ns/s.sc;
+  s.ox=mx-(mx-s.ox)*ratio;
+  s.oy=my-(my-s.oy)*ratio;
+  s.sc=ns;
+  updateUI();
+}},{{passive:false}});
+
+/* --- Touch interaction --- */
+let tState=null;
+cv.addEventListener('touchstart',e=>{{
+  e.preventDefault();
+  const rect=cv.getBoundingClientRect();
+  const sc=getCvScale();
+  if(e.touches.length===1){{
+    const t=e.touches[0];
+    const ox=(t.clientX-rect.left)/sc, oy=(t.clientY-rect.top)/sc;
+    sel=hitTest(ox,oy);updateUI();
+    tState={{mode:'drag',sx:t.clientX,sy:t.clientY,sox:S[sel].ox,soy:S[sel].oy}};
+  }}else if(e.touches.length===2){{
+    const t0=e.touches[0],t1=e.touches[1];
+    const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+    tState={{mode:'pinch',dist0:dist,sc0:S[sel].sc,
+      cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
+      ox0:S[sel].ox,oy0:S[sel].oy}};
+  }}
+}},{{passive:false}});
+
+cv.addEventListener('touchmove',e=>{{
+  e.preventDefault();
+  if(!tState)return;
+  const sc=getCvScale();
+  const s=S[sel];
+  if(tState.mode==='drag'&&e.touches.length===1){{
+    const t=e.touches[0];
+    s.ox=tState.sox+(t.clientX-tState.sx)/sc;
+    s.oy=tState.soy+(t.clientY-tState.sy)/sc;
+    draw();updateUI();
+  }}else if(e.touches.length===2){{
+    const t0=e.touches[0],t1=e.touches[1];
+    const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+    if(tState.mode==='drag'){{
+      tState={{mode:'pinch',dist0:dist,sc0:s.sc,
+        cx0:(t0.clientX+t1.clientX)/2,cy0:(t0.clientY+t1.clientY)/2,
+        ox0:s.ox,oy0:s.oy}};
+      return;
+    }}
+    const ratio=dist/tState.dist0;
+    const ns=Math.max(0.2,Math.min(5,tState.sc0*ratio));
+    const r=ns/tState.sc0;
+    const rect=cv.getBoundingClientRect();
+    const mx=(tState.cx0-rect.left)/sc, my=(tState.cy0-rect.top)/sc;
+    s.ox=mx-(mx-tState.ox0)*r;
+    s.oy=my-(my-tState.oy0)*r;
+    const cx=(t0.clientX+t1.clientX)/2;
+    const cy=(t0.clientY+t1.clientY)/2;
+    s.ox+=(cx-tState.cx0)/sc;
+    s.oy+=(cy-tState.cy0)/sc;
+    s.sc=ns;
+    draw();updateUI();
+  }}
+}},{{passive:false}});
+cv.addEventListener('touchend',e=>{{
+  if(e.touches.length===0)tState=null;
+  else if(e.touches.length===1){{
+    const t=e.touches[0];
+    tState={{mode:'drag',sx:t.clientX,sy:t.clientY,sox:S[sel].ox,soy:S[sel].oy}};
+  }}
+}});
+cv.addEventListener('touchcancel',()=>{{tState=null}});
+
+/* Resize */
+let resizeT;
+window.addEventListener('resize',()=>{{clearTimeout(resizeT);resizeT=setTimeout(draw,100)}});
+
+/* Full-res render for download */
+function renderFull(){{
   const c=document.getElementById('cv');c.width=OW;c.height=OH;
   const ctx=c.getContext('2d');
   ctx.fillStyle='#0f0f0f';ctx.fillRect(0,0,OW,OH);
+
   S.forEach((s,i)=>{{
-    const vs=getVpSize(s.vp);
-    const imgW=vs.w*s.isc*s.sc, imgH=vs.h*s.isc*s.sc;
-    const rx=SW/imgW, ry=SH/imgH;
-    const sx_=(-s.ox*vs.w)*rx, sy_=(-s.oy*vs.h)*ry;
-    const sw_=vs.w*rx, sh_=vs.h*ry;
-    const px=(i===S.length-1)?OW-PW:i*PW;
-    const pw=(i===S.length-1)?PW:PW+1;
+    const im=imgs[i];if(!im.complete)return;
+    const pw=PW,ph=OH;
+    const px=i*PW;
     ctx.save();
-    ctx.beginPath();ctx.rect(px,0,pw,OH);ctx.clip();
-    const pcx=px+PW/2,pcy=OH/2;
-    if(Math.abs(s.rot)>0.01){{
-      const rad=Math.abs(s.rot)*Math.PI/180;
-      const exW=Math.ceil(PW*Math.abs(Math.cos(rad))+OH*Math.abs(Math.sin(rad)));
-      const exH=Math.ceil(PW*Math.abs(Math.sin(rad))+OH*Math.abs(Math.cos(rad)));
-      const exSx=sw_*(exW-PW)/(2*PW),exSy=sh_*(exH-OH)/(2*OH);
-      ctx.translate(pcx,pcy);
-      ctx.rotate(s.rot*Math.PI/180);
-      ctx.drawImage(s.img,sx_-exSx,sy_-exSy,sw_+2*exSx,sh_+2*exSy,-exW/2,-exH/2,exW,exH);
-    }}else{{
-      ctx.drawImage(s.img,sx_,sy_,sw_,sh_,px,0,pw,OH);
-    }}
+    ctx.beginPath();ctx.rect(px,0,pw,ph);ctx.clip();
+    const imgR=im.naturalWidth/im.naturalHeight;
+    const slotR=pw/ph;
+    let drawW,drawH;
+    if(imgR>slotR){{drawH=ph*s.sc;drawW=drawH*imgR}}
+    else{{drawW=pw*s.sc;drawH=drawW/imgR}}
+    ctx.translate(s.ox, s.oy);
+    if(Math.abs(s.rot)>0.01)ctx.rotate(s.rot*Math.PI/180);
+    ctx.drawImage(im, -drawW/2, -drawH/2, drawW, drawH);
     ctx.restore();
   }});
-  const fm='{footer_mode}';
-  if(fm==='clinic'&&'{footer_text_escaped}'){{
-    const fh=Math.round(OH*0.08),fy=OH-fh;
-    ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,fy,OW,fh);
-    ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(0,fy);ctx.lineTo(OW,fy);ctx.stroke();
-    const fs=Math.round(fh*0.6);
-    ctx.font=fs+'px "Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans CJK JP","Meiryo",sans-serif';
-    ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
-    ctx.fillText('{footer_text_escaped}',OW/2,fy+fh/2);
-  }}else if(fm==='sns'){{
-    const fs=Math.round(OH*0.03);
-    ctx.font=fs+'px "Hiragino Kaku Gothic ProN",sans-serif';
-    ctx.fillStyle='rgba(255,255,255,0.85)';ctx.textAlign='right';ctx.textBaseline='bottom';
-    ctx.fillText('{sns_handle_escaped}',OW-20,OH-20);
-  }}
+
+  drawFooter(ctx,OW,OH);
   return c;
 }}
-function dl(fmt){{
-  const c=render();const a=document.createElement('a');
+
+function dlFull(fmt){{
+  const c=renderFull();const a=document.createElement('a');
   if(fmt==='webp'){{a.download='case_composite.webp';a.href=c.toDataURL('image/webp',0.92)}}
   else{{a.download='case_composite.png';a.href=c.toDataURL('image/png')}}
   a.click();
+  draw();/* restore preview canvas */
 }}
+
 function resetAll(){{
-  S.forEach(s=>{{
+  S.forEach((s,i)=>{{
     s.sc=1;s.rot=0;s.ox=s.initOx;s.oy=s.initOy;
-    applyTransform(s);
   }});
+  updateUI();
 }}
-init();
+
+/* Initial draw once all images loaded or on next frame */
+requestAnimationFrame(()=>{{if(loadCount===N)draw();else setTimeout(draw,500)}});
 </script></body></html>"""
 
 
@@ -816,7 +917,7 @@ def main():
     )
 
     st.title("🦷 歯科症例写真 自動合成アプリ")
-    st.caption("OpenCV + AI で5枚の口腔内写真を自動で回転・クロップ・合成します")
+    st.caption("OpenCV + AI で口腔内写真を自動で回転・クロップ・合成します")
 
     # ---- サイドバー ----
     with st.sidebar:
@@ -824,7 +925,7 @@ def main():
 
         output_mode = st.radio(
             "出力モード",
-            ["医院名フッター", "SNSオーバーレイ"],
+            ["医院名フッター", "SNSオーバーレイ", "シンプル（ロゴなし）"],
             help="完成画像のフッターデザインを選択",
         )
 
@@ -832,7 +933,7 @@ def main():
             clinic_name = st.text_input("医院名", value="坂寄歯科医院")
             sns_handle = ""
             logo_file = None
-        else:
+        elif output_mode == "SNSオーバーレイ":
             clinic_name = ""
             sns_handle = st.text_input("SNSハンドル", value="@dentist_mickey")
             logo_file = st.file_uploader(
@@ -840,6 +941,10 @@ def main():
                 type=["png"],
                 help="右下に表示するロゴアイコン",
             )
+        else:
+            clinic_name = ""
+            sns_handle = ""
+            logo_file = None
 
         st.divider()
 
@@ -857,32 +962,34 @@ def main():
         )
 
         st.divider()
-        st.caption("v3.5 — レスポンシブ対応")
+        st.caption("v3.6 — 3〜5枚対応")
 
     # ---- 写真アップロード ----
-    st.subheader("📷 写真をアップロード（5枚まとめてドラッグ＆ドロップ可）")
+    st.subheader("📷 写真をアップロード（3〜5枚・ドラッグ＆ドロップ可）")
     uploaded_files = st.file_uploader(
-        "5枚の症例写真を選択またはドラッグ＆ドロップ",
+        "症例写真を選択またはドラッグ＆ドロップ",
         type=["jpg", "jpeg", "png", "tiff"],
         accept_multiple_files=True,
         key="photos",
     )
 
     if len(uploaded_files) == 0:
-        st.info("5枚の写真をアップロードしてください（複数選択・ドラッグ＆ドロップ対応）")
+        st.info("3〜5枚の写真をアップロードしてください（複数選択・ドラッグ＆ドロップ対応）")
         return
 
-    if len(uploaded_files) != NUM_PANELS:
-        st.warning(f"現在 {len(uploaded_files)} 枚です。{NUM_PANELS} 枚ちょうどアップロードしてください。")
+    num_panels = len(uploaded_files)
+    if num_panels < MIN_PANELS or num_panels > MAX_PANELS:
+        st.warning(f"現在 {num_panels} 枚です。{MIN_PANELS}〜{MAX_PANELS} 枚アップロードしてください。")
         return
 
-    st.success("✅ 5枚すべてアップロード済み")
+    labels = PHOTO_LABELS_DEFAULT[:num_panels] if num_panels <= len(PHOTO_LABELS_DEFAULT) else [f"写真{i+1}" for i in range(num_panels)]
+    st.success(f"✅ {num_panels}枚アップロード済み")
 
     # プレビュー
-    cols = st.columns(NUM_PANELS)
+    cols = st.columns(num_panels)
     for i, (col, f) in enumerate(zip(cols, uploaded_files)):
         with col:
-            st.image(f, caption=PHOTO_LABELS[i], use_container_width=True)
+            st.image(f, caption=labels[i], use_container_width=True)
 
     images = []
     for f in uploaded_files:
@@ -890,94 +997,89 @@ def main():
         img = Image.open(f)
         images.append(img.copy())
 
-    # ---- 処理ボタン ----
-    cv_clicked = st.button(
-        "📐 CV自動編集",
-        type="primary",
-        use_container_width=True,
-    )
-
-    # ---- CV処理 ----
-    if cv_clicked:
-        # 前回のエディタソースをクリア
+    # ---- エディタ用ソース画像を生成（アップロード直後に表示） ----
+    # ファイル数が変わったらリセット
+    if "editor_sources" in st.session_state and len(st.session_state["editor_sources"]) != num_panels:
         st.session_state.pop("editor_sources", None)
         st.session_state.pop("editor_zooms", None)
-        progress = st.progress(0, text="OpenCV処理中...")
+        st.session_state.pop("editor_source_sizes", None)
+        st.session_state.pop("cv_result", None)
+    if "editor_sources" not in st.session_state:
+        sources = []
+        source_sizes = []
+        for img in images:
+            src = generate_editor_source_simple(img, rotation_deg=default_rotation)
+            sources.append(_img_to_data_url(src))
+            source_sizes.append(src.size)
+        st.session_state["editor_sources"] = sources
+        st.session_state["editor_source_sizes"] = source_sizes
+        st.session_state["editor_zooms"] = [1.0] * num_panels
 
-        result_panels = []
-        for i, img in enumerate(images):
-            progress.progress(
-                int((i / NUM_PANELS) * 60),
-                text=f"写真 {i+1}/5 を解析中...",
-            )
-            cv_result = cv_detect_crop(img, rotation_deg=default_rotation)
-            result_panels.append({
-                "index": i + 1,
-                "rotation_cw_deg": cv_result["rotation_cw_deg"],
-                "crop": cv_result["crop"],
-                "method": cv_result.get("method", "mirror"),
-                "zoom_boost": cv_result.get("zoom_boost", 2.0),
-            })
+    # ---- ドラッグ編集エディタ（常に表示） ----
+    st.subheader("🎨 各写真を調整 → ダウンロード")
+    st.caption("ドラッグ=移動 ／ ホイール=ズーム ／ 下のボタンで回転・ズーム調整")
 
-        result = {"panels": result_panels}
-        st.session_state["cv_result"] = result
+    mode = "clinic" if output_mode == "医院名フッター" else ("sns" if output_mode == "SNSオーバーレイ" else "plain")
+    out_w, out_h = output_size
 
-        progress.progress(60, text="画像合成中...")
-
-        out_w, out_h = output_size
-        panel_w = out_w // NUM_PANELS
-
-        processed_panels = []
-        for i, panel_data in enumerate(result_panels):
-            panel = process_single_panel(
-                images[i],
-                panel_data["rotation_cw_deg"],
-                panel_data["crop"],
-                panel_w,
-                out_h,
-                zoom_boost=panel_data.get("zoom_boost", 2.0),
-            )
-            processed_panels.append(panel)
-            progress.progress(
-                60 + int((i + 1) / NUM_PANELS * 25),
-                text=f"写真 {i+1}/5 処理完了",
-            )
-
-        st.session_state["processed_panels"] = processed_panels
-
-        # デバッグ画像を保存
-        debug_images = []
-        for i, img in enumerate(images):
-            debug_img = cv_create_debug_image(img, result_panels[i]["rotation_cw_deg"])
-            debug_images.append(debug_img)
-        st.session_state["cv_debug_images"] = debug_images
-
-        logo_img = None
-        if logo_file is not None:
-            logo_img = Image.open(logo_file)
-
-        mode = "clinic" if output_mode == "医院名フッター" else "sns"
-        composite = compose_panels(
-            processed_panels,
-            output_size,
-            mode=mode,
-            clinic_name=clinic_name,
-            sns_handle=sns_handle,
-            logo_img=logo_img,
+    # エディタHTMLをキャッシュ（出力モード変更時に再生成しない）
+    editor_cache_key = f"v5_{num_panels}_{out_w}_{out_h}"
+    if st.session_state.get("_editor_cache_key") != editor_cache_key:
+        # 全モードの情報を渡す（JS側で切り替え可能）
+        html = build_editor_html(
+            source_data_urls=st.session_state["editor_sources"],
+            labels=labels,
+            zoom_boosts=st.session_state.get("editor_zooms", [2.0] * num_panels),
+            source_sizes=st.session_state.get("editor_source_sizes", [(800, 600)] * num_panels),
+            output_w=out_w,
+            output_h=out_h,
         )
-        st.session_state["composite"] = composite
-        progress.progress(100, text="完成！")
+        st.session_state["_editor_html"] = html
+        st.session_state["_editor_cache_key"] = editor_cache_key
 
-    # ---- ドラッグ編集エディタ ----
-    if "cv_result" in st.session_state:
-        cv_result = st.session_state["cv_result"]
-        st.subheader("🎨 ドラッグで微調整 → ダウンロード")
+    # キャンバス高さ(ブラウザ幅ベース、約800px幅想定) + 操作パネル分
+    canvas_display_h = int(800 * out_h / out_w)
+    editor_height = min(900, canvas_display_h + 180)
+    components.html(st.session_state["_editor_html"], height=editor_height, scrolling=True)
 
-        # エディタ用ソース画像を生成（キャッシュ）
-        if "editor_sources" not in st.session_state:
+    # ---- CV自動編集（オプション） ----
+    with st.expander("📐 CV自動編集（オプション：自動トリミング）", expanded=False):
+        st.caption("OpenCVで歯列を検出し自動トリミングします。手動調整で十分な場合は不要です。")
+        cv_clicked = st.button(
+            "CV自動編集を実行",
+            use_container_width=True,
+        )
+
+        if cv_clicked:
+            st.session_state.pop("editor_sources", None)
+            st.session_state.pop("editor_zooms", None)
+            st.session_state.pop("editor_source_sizes", None)
+            progress = st.progress(0, text="OpenCV処理中...")
+
+            result_panels = []
+            for i, img in enumerate(images):
+                progress.progress(
+                    int((i / num_panels) * 60),
+                    text=f"写真 {i+1}/{num_panels} を解析中...",
+                )
+                cv_result = cv_detect_crop(img, rotation_deg=default_rotation)
+                result_panels.append({
+                    "index": i + 1,
+                    "rotation_cw_deg": cv_result["rotation_cw_deg"],
+                    "crop": cv_result["crop"],
+                    "method": cv_result.get("method", "mirror"),
+                    "zoom_boost": cv_result.get("zoom_boost", 2.0),
+                })
+
+            result = {"panels": result_panels}
+            st.session_state["cv_result"] = result
+
+            progress.progress(60, text="エディタソース生成中...")
+
             sources = []
             zooms = []
-            for i, panel_data in enumerate(cv_result["panels"]):
+            source_sizes = []
+            for i, panel_data in enumerate(result_panels):
                 zb = panel_data.get("zoom_boost", 2.0)
                 src = generate_editor_source(
                     images[i],
@@ -987,35 +1089,27 @@ def main():
                 )
                 sources.append(_img_to_data_url(src))
                 zooms.append(zb)
+                source_sizes.append(src.size)
             st.session_state["editor_sources"] = sources
             st.session_state["editor_zooms"] = zooms
+            st.session_state["editor_source_sizes"] = source_sizes
 
-        mode = "clinic" if output_mode == "医院名フッター" else "sns"
-        out_w, out_h = output_size
-        html = build_editor_html(
-            source_data_urls=st.session_state["editor_sources"],
-            labels=PHOTO_LABELS,
-            zoom_boosts=st.session_state.get("editor_zooms", [2.0] * NUM_PANELS),
-            output_w=out_w,
-            output_h=out_h,
-            footer_text=clinic_name if mode == "clinic" else "",
-            footer_mode=mode,
-            sns_handle=sns_handle,
-        )
-        components.html(html, height=700, scrolling=True)
+            progress.progress(100, text="完了！ページをリロードしてエディタに反映します。")
+            st.rerun()
 
-        # ---- CVデバッグ ----
-        if "cv_debug_images" in st.session_state:
-            with st.expander("🔬 CV歯検出デバッグ（緑=歯マスク, 赤枠=crop範囲）", expanded=False):
-                debug_cols = st.columns(NUM_PANELS)
-                for i, (col, dbg) in enumerate(zip(debug_cols, st.session_state["cv_debug_images"])):
-                    with col:
-                        st.image(dbg, caption=PHOTO_LABELS[i], use_container_width=True)
+    # ---- CVデバッグ ----
+    if "cv_result" in st.session_state:
+        with st.expander("🔬 CV歯検出デバッグ", expanded=False):
+            debug_cols = st.columns(num_panels)
+            for i in range(min(num_panels, len(images))):
+                cv_res = st.session_state["cv_result"]
+                if i < len(cv_res["panels"]):
+                    debug_img = cv_create_debug_image(images[i], cv_res["panels"][i]["rotation_cw_deg"])
+                    with debug_cols[i]:
+                        st.image(debug_img, caption=labels[i], use_container_width=True)
 
-        # ---- デバッグ ----
         with st.expander("🐛 分析結果（デバッグ用）", expanded=False):
-            if "cv_result" in st.session_state:
-                st.json(st.session_state["cv_result"])
+            st.json(st.session_state["cv_result"])
 
 
 if __name__ == "__main__":
